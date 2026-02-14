@@ -28,6 +28,9 @@
     --custom-bg-opacity: 0;
     --ui-opacity: 1;
     --radius: 8px;
+    --sidebar-width-desktop: 220px;
+    --sidebar-width-tablet: 188px;
+    --mobile-sidebar-top: 94px;
 }
 
 :root[data-theme="dark"] {
@@ -95,6 +98,11 @@
     padding: 0;
 }
 
+html {
+    height: 100%;
+    background-color: var(--bg-color);
+}
+
 /* Animations */
 @keyframes fadeIn {
     from { opacity: 0; }
@@ -139,7 +147,13 @@ body {
     background-color: var(--bg-color);
     color: var(--text-color);
     height: 100vh;
+    height: 100dvh;
+    min-height: 100vh;
+    min-height: 100dvh;
     position: relative;
+    /* Create a local stacking context so body::before (z-index:-1) stays visible behind content. */
+    z-index: 0;
+    isolation: isolate;
     display: flex;
     flex-direction: column;
     overflow: hidden; /* 防止整个页面出现滚动条，确保滚动只发生在内容区域 */
@@ -149,6 +163,8 @@ body::before {
     content: "";
     position: fixed;
     inset: 0;
+    width: 100vw;
+    height: 100dvh;
     background-color: var(--bg-color);
     background-image: var(--custom-bg-image, none);
     background-size: cover;
@@ -158,6 +174,7 @@ body::before {
     transition: opacity 0.4s ease-out;
     pointer-events: none;
     z-index: -1;
+    transform: translateZ(0);
 }
 
 /* 背景图淡入 - 与容器同步 */
@@ -169,6 +186,17 @@ body.bg-ready.custom-bg-enabled::before {
 body.custom-bg-enabled:not(.bg-ready)::before {
     opacity: var(--custom-bg-opacity, 0.7);
     transition: opacity 0.3s ease-out;
+}
+
+@supports (-webkit-touch-callout: none) {
+    html,
+    body {
+        min-height: -webkit-fill-available;
+    }
+
+    body::before {
+        height: -webkit-fill-available;
+    }
 }
 
 .container {
@@ -296,6 +324,36 @@ header {
     transform: scale(0.95) rotate(90deg);
 }
 
+.sidebar-toggle-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: var(--card-bg);
+    color: var(--text-color);
+    cursor: pointer;
+    box-shadow: var(--shadow);
+    font-size: 14px;
+    line-height: 1;
+    white-space: nowrap;
+    transition: transform 0.18s ease, background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.sidebar-toggle-btn:hover {
+    background: var(--hover-bg);
+    border-color: var(--primary-color);
+}
+
+.sidebar-toggle-btn:active {
+    transform: scale(0.97);
+}
+
+.sidebar-backdrop {
+    display: none;
+}
 
 
 /* Main Layout */
@@ -304,17 +362,19 @@ main {
     flex: 1;
     gap: 20px;
     overflow: hidden; /* 防止溢出 */
+    min-height: 0;
 }
 
 /* Sidebar */
 .sidebar {
-    width: 200px;
+    width: var(--sidebar-width-desktop);
     background: var(--sidebar-bg);
     border-radius: var(--radius);
     padding: 10px;
     box-shadow: var(--shadow);
     display: flex;
     flex-direction: column;
+    flex-shrink: 0;
     animation: slideInRight 0.5s ease-out 0.2s backwards;
 }
 
@@ -323,6 +383,7 @@ main {
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
 }
 
 .sidebar li {
@@ -336,6 +397,7 @@ main {
     align-items: center;
     position: relative;
     overflow: hidden;
+    touch-action: manipulation;
 }
 
 .sidebar li:hover {
@@ -410,6 +472,8 @@ main {
     overflow-y: auto;
     padding: 5px; /* 给滚动条留点空间 */
     scrollbar-gutter: stable; /* 预留滚动条空间，防止内容跳动 */
+    min-width: 0;
+    -webkit-overflow-scrolling: touch;
 }
 
 .grid {
@@ -438,6 +502,7 @@ main {
     position: relative;
     text-decoration: none;
     color: inherit;
+    touch-action: manipulation;
     /* 初始状态由 animation 控制 */
     animation: fadeInUp 0.5s ease-out backwards;
 }
@@ -676,6 +741,7 @@ main {
     max-width: 400px;
     box-shadow: 0 20px 50px rgba(0,0,0,0.2);
     max-height: 90vh;
+    max-height: 90dvh;
     overflow: hidden;
     transform-origin: center center;
     display: flex;
@@ -696,6 +762,7 @@ main {
     overflow-y: auto;
     flex: 1;
     min-height: 0;
+    -webkit-overflow-scrolling: touch;
 }
 
 .modal-footer {
@@ -1913,4 +1980,175 @@ body.batch-select-active .folder-modal .add-bookmark-card {
     margin-top: 8px;
     color: var(--text-secondary);
     opacity: 0.7;
+}
+
+@media (min-width: 1600px) {
+    .container {
+        max-width: 2400px;
+        padding: 24px 28px;
+    }
+
+    main {
+        gap: 26px;
+    }
+
+    .sidebar {
+        width: 248px;
+    }
+
+    .grid {
+        grid-template-columns: repeat(auto-fit, minmax(92px, 120px));
+        gap: 14px;
+    }
+}
+
+@media (max-width: 1366px) {
+    .container {
+        padding: 16px;
+    }
+
+    header {
+        padding: 28px 0;
+    }
+
+    .sidebar {
+        width: 204px;
+    }
+}
+
+@media (max-width: 1024px) {
+    .container {
+        padding: 14px;
+    }
+
+    header {
+        padding: 20px 0;
+    }
+
+    main {
+        gap: 14px;
+    }
+
+    .sidebar {
+        width: var(--sidebar-width-tablet);
+    }
+
+    .grid {
+        grid-template-columns: repeat(auto-fit, minmax(84px, 114px));
+        gap: 11px;
+    }
+}
+
+@media (max-width: 767px) {
+    body {
+        overflow-x: hidden;
+    }
+
+    .container {
+        padding: 10px 10px calc(10px + env(safe-area-inset-bottom, 0px));
+    }
+
+    header {
+        padding: calc(10px + env(safe-area-inset-top, 0px)) 0 12px;
+    }
+
+    .header-bar {
+        justify-content: stretch;
+        gap: 8px;
+    }
+
+    .sidebar-toggle-btn {
+        display: inline-flex;
+    }
+
+    .search-bar {
+        min-width: 0;
+    }
+
+    .search-wrapper {
+        border-radius: 18px;
+    }
+
+    .search-engine-select {
+        width: 74px;
+        padding: 10px 12px;
+        border-radius: 18px 0 0 18px;
+        font-size: 16px;
+    }
+
+    .search-bar input {
+        padding: 10px 14px;
+        border-radius: 0 18px 18px 0;
+        font-size: 16px;
+    }
+
+    .sidebar-search input,
+    .modal-body input,
+    .modal-body select,
+    .modal-body textarea {
+        font-size: 16px;
+    }
+
+    main {
+        gap: 0;
+        position: relative;
+        min-height: 0;
+    }
+
+    .sidebar {
+        position: fixed;
+        top: var(--mobile-sidebar-top, 94px);
+        left: calc(env(safe-area-inset-left, 0px) + 10px);
+        bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
+        width: min(84vw, 320px);
+        max-width: 320px;
+        z-index: 950;
+        transform: translateX(calc(-100% - 20px));
+        transition: transform 0.24s ease;
+        pointer-events: none;
+        animation: none;
+    }
+
+    body.sidebar-open .sidebar {
+        transform: translateX(0);
+        pointer-events: auto;
+    }
+
+    .sidebar-backdrop {
+        display: block;
+        position: fixed;
+        inset: 0;
+        z-index: 900;
+        border: none;
+        background: var(--overlay);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.24s ease;
+    }
+
+    body.sidebar-open .sidebar-backdrop {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .content {
+        padding: 0;
+    }
+
+    .grid {
+        grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+        gap: 10px;
+        justify-content: stretch;
+    }
+
+    .bookmark-card,
+    .add-bookmark-card {
+        width: 100%;
+        min-width: 0;
+    }
+
+    .settings-fab {
+        right: 14px;
+        bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    }
 }

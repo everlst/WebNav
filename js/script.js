@@ -47,52 +47,36 @@ function createDefaultBookmark(id, title, url) {
     };
 }
 
+const LOCAL_ONLY_MODE = true;
+
 const STORAGE_MODES = {
-    BROWSER: 'browser',
-    SYNC: 'sync',
-    WEBDAV: 'webdav',
-    GIST: 'gist'
+    BROWSER: 'browser'
 };
 
 const STORAGE_KEYS = {
     DATA: 'MyLocalNewTabData',
     SETTINGS: 'MyLocalNewTabSettings',
+    // 兼容历史版本：旧版本可能把背景图拆分到单独 key 中
     BACKGROUND_IMAGE: 'MyLocalNewTabBgImage'
 };
 
 const DEFAULT_BACKGROUND = {
-    mode: 'local',
     image: '',
-    opacity: 0.7,
-    cloud: {
-        fileName: 'background',
-        downloadUrl: '',
-        updatedAt: 0,
-        etag: '',
-        lastModified: ''
-    }
+    source: '',
+    opacity: 0.7
 };
 
 const DEFAULT_SETTINGS = {
     storageMode: STORAGE_MODES.BROWSER,
     searchEngine: 'google',
-    webdav: {
-        endpoint: '',
-        username: '',
-        password: ''
-    },
-    gist: {
-        token: '',
-        gistId: '',
-        filename: 'MyLocalNewTab-data.json'
-    },
     background: JSON.parse(JSON.stringify(DEFAULT_BACKGROUND)),
-    uiOpacity: 1
+    uiOpacity: 1,
+    customDomain: ''
 };
 
 const DEFAULT_SWATCH_COLOR = '#4ac55c';
-const DEFAULT_REMOTE_FILENAME = 'MyLocalNewTab-data.json';
-const REMOTE_FETCH_TIMEOUT = 12000;
+const NETWORK_FETCH_TIMEOUT = 12000;
+const LEGACY_BG_PLACEHOLDER = 'Check_STORAGE_KEYS_BACKGROUND_IMAGE';
 
 const IMPORT_SOURCES = {
     EDGE_TAB: 'MyLocalNewTab',
@@ -111,7 +95,45 @@ const CACHE_KEYS = {
 };
 
 const MAX_CACHED_ICON_BYTES = 500 * 1024;
-const BACKGROUND_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif'];
+const DEFAULT_EXTERNAL_FETCH_MAX_BYTES = 30 * 1024 * 1024;
+const DEFAULT_EXTERNAL_TEXT_FETCH_MAX_BYTES = 1024 * 1024;
+const LOCAL_ASSET_PATH_PATTERN = /^\/assets\/[0-9a-f]{32}(?:\.[a-z0-9]{1,8})?$/i;
+
+/**
+ * 获取 API 基础 URL。
+ * 如果设置了自定义域名则使用该域名，否则返回空字符串（使用当前 origin）。
+ */
+function getApiBaseUrl() {
+    const domain = (typeof appSettings !== 'undefined' && appSettings && appSettings.customDomain) || '';
+    if (!domain) return '';
+    // 去除末尾斜杠
+    return domain.replace(/\/+$/, '');
+}
+
+/**
+ * 将相对路径 API 地址解析为完整 URL。
+ * 如果设置了自定义域名则拼接完整地址，否则保留相对路径。
+ */
+function resolveApiUrl(path) {
+    const base = getApiBaseUrl();
+    if (!base) return path;
+    // 确保 path 以 / 开头
+    const normalizedPath = path.startsWith('/') ? path : '/' + path;
+    return base + normalizedPath;
+}
+
+/**
+ * 将 /assets/ 相对路径解析为完整 URL（用于资源展示）。
+ * 仅当设置了自定义域名且路径是本地资源路径时才拼接。
+ */
+function resolveAssetDisplayUrl(path) {
+    if (!path || typeof path !== 'string') return path;
+    const normalized = normalizePersistedAssetUrl(path);
+    if (isPersistedAssetPath(normalized)) {
+        return resolveApiUrl(normalized);
+    }
+    return normalized;
+}
 
 function clamp01(value, fallback = 0) {
     const num = typeof value === 'string' ? parseFloat(value) : value;
@@ -121,26 +143,61 @@ function clamp01(value, fallback = 0) {
     return num;
 }
 
+function isPersistedAssetPath(path = '') {
+    if (!path || typeof path !== 'string') return false;
+    const plainPath = path.split('?')[0].split('#')[0];
+    return LOCAL_ASSET_PATH_PATTERN.test(plainPath);
+}
+
+function isPersistedAssetReference(value = '') {
+    if (!value || typeof value !== 'string') return false;
+    if (isPersistedAssetPath(value)) return true;
+    try {
+        const parsed = new URL(value);
+        return isPersistedAssetPath(`${parsed.pathname}${parsed.search}`);
+    } catch (error) {
+        return false;
+    }
+}
+
+function normalizePersistedAssetUrl(value) {
+    if (typeof value !== 'string') return '';
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+
+    if (isPersistedAssetPath(trimmed)) {
+        return trimmed.split('#')[0];
+    }
+
+    try {
+        const parsed = new URL(trimmed);
+        if (isPersistedAssetPath(parsed.pathname)) {
+            // Keep persisted local assets host-agnostic for cross-device sync.
+            return `${parsed.pathname}${parsed.search}`;
+        }
+    } catch (error) {
+        // Keep non-URL strings as-is.
+    }
+
+    return trimmed;
+}
+
 function normalizeBackgroundSettings(raw = {}) {
     const merged = { ...DEFAULT_BACKGROUND, ...(raw || {}) };
-    const cloud = merged.cloud && typeof merged.cloud === 'object' ? merged.cloud : {};
-    const fileName = typeof cloud.fileName === 'string' && cloud.fileName.trim()
-        ? cloud.fileName.trim()
-        : DEFAULT_BACKGROUND.cloud.fileName;
-    const downloadUrl = typeof cloud.downloadUrl === 'string' ? stripCacheBust(cloud.downloadUrl) : '';
-    const etag = typeof cloud.etag === 'string' ? cloud.etag : '';
-    const lastModified = typeof cloud.lastModified === 'string' ? cloud.lastModified : '';
+    const imageRaw = typeof merged.image === 'string' ? merged.image : '';
+    const image = normalizePersistedAssetUrl(imageRaw);
+    const source = typeof merged.source === 'string'
+        ? merged.source.trim()
+        : (typeof merged.sourceUrl === 'string' ? merged.sourceUrl.trim() : '');
+    const normalizedSource = source || (
+        image && !isPersistedAssetReference(image) && !image.startsWith('data:')
+            ? image
+            : ''
+    );
     return {
-        mode: merged.mode === 'cloud' ? 'cloud' : 'local',
-        image: typeof merged.image === 'string' ? merged.image : '',
-        opacity: clamp01(merged.opacity, DEFAULT_BACKGROUND.opacity),
-        cloud: {
-            fileName,
-            downloadUrl,
-            updatedAt: Number.isFinite(cloud.updatedAt) ? cloud.updatedAt : 0,
-            etag,
-            lastModified
-        }
+        image: image === LEGACY_BG_PLACEHOLDER ? '' : image,
+        source: normalizedSource,
+        opacity: clamp01(merged.opacity, DEFAULT_BACKGROUND.opacity)
     };
 }
 
@@ -165,40 +222,28 @@ function applyUiOpacity(value = appSettings.uiOpacity) {
 function mergeSettingsWithDefaults(raw = {}) {
     const base = raw && typeof raw === 'object' ? raw : {};
     const background = normalizeBackgroundSettings(base.background);
-    return {
+    const merged = {
         ...DEFAULT_SETTINGS,
         ...base,
-        webdav: { ...DEFAULT_SETTINGS.webdav, ...(base.webdav || {}) },
-        gist: { ...DEFAULT_SETTINGS.gist, ...(base.gist || {}) },
         uiOpacity: normalizeUiOpacity(base.uiOpacity),
-        background
+        background,
+        customDomain: typeof base.customDomain === 'string' ? base.customDomain.trim() : ''
     };
+    merged.storageMode = STORAGE_MODES.BROWSER;
+    return merged;
 }
 
 function isRemoteMode(mode) {
-    return mode === STORAGE_MODES.WEBDAV || mode === STORAGE_MODES.GIST;
+    return false;
 }
 
 function getEffectiveStorageMode() {
-    const current = appSettings.storageMode || STORAGE_MODES.BROWSER;
-    const selected = typeof getSelectedStorageMode === 'function' ? getSelectedStorageMode() : null;
-    if (isRemoteMode(current)) return current;
-    if (selected && isRemoteMode(selected)) return selected;
-    return current;
+    return STORAGE_MODES.BROWSER;
 }
 
 function isRemoteBackgroundReady() {
-    const effective = getEffectiveStorageMode();
-    if (isRemoteMode(effective)) return true;
-    // remoteActionsEnabled 表示已通过“应用配置”验证远程配置
-    const selected = typeof getSelectedStorageMode === 'function' ? getSelectedStorageMode() : null;
-    return remoteActionsEnabled && isRemoteMode(selected);
+    return false;
 }
-
-const syncWarningState = {
-    webdav: false,
-    gist: false
-};
 
 // 默认数据
 // 优化深拷贝函数
@@ -239,11 +284,6 @@ let selectedCustomIconSrc = '';
 let customIconMode = 'upload';
 let pendingAutoIconSelectionSrc = null;
 let lastAutoIconUrl = '';
-let cloudBackgroundRuntime = {
-    url: '',
-    version: '',
-    isObjectUrl: false
-};
 let isFetchingAutoIcons = false;
 const DRAG_LONG_PRESS_MS = 90; // 调优为 90ms，提供更灵敏的选中体验
 const dragState = {
@@ -548,12 +588,18 @@ function moveBookmarkTo(bookmarkId, targetCategoryId, targetFolderId = null, tar
 }
 
 let pendingStorageMode = STORAGE_MODES.BROWSER;
-let remoteActionsEnabled = false;
 let pointerDownOutsideModal = false;
 let pointerDownOnContextMenu = false;
+const MOBILE_LAYOUT_BREAKPOINT = 768;
+let isMobileSidebarOpen = false;
+let responsiveLayoutFrame = null;
 
 // DOM 元素
 const els = {
+    header: document.querySelector('header'),
+    sidebar: document.getElementById('sidebarNav'),
+    sidebarToggleBtn: document.getElementById('sidebarToggleBtn'),
+    sidebarBackdrop: document.getElementById('sidebarBackdrop'),
     searchInput: document.getElementById('searchInput'),
     searchEngineSelect: document.getElementById('searchEngineSelect'),
     categoryList: document.getElementById('categoryList'),
@@ -588,15 +634,10 @@ const els = {
     toggleBgSettingsBtn: document.getElementById('toggleBgSettingsBtn'),
     bgSettingsPanel: document.getElementById('bgSettingsPanel'),
     bgLocalSection: document.getElementById('bgLocalSection'),
-    bgCloudSection: document.getElementById('bgCloudSection'),
     bgModeTabs: document.querySelectorAll('.bg-mode-tab'),
     bgModePanels: document.querySelectorAll('.bg-mode-panel'),
     bgStatusTag: document.getElementById('bgStatusTag'),
-    backgroundSourceRadios: document.getElementsByName('backgroundSource'),
     bgSourceTip: document.getElementById('bgSourceTip'),
-    cloudBgStatus: document.getElementById('cloudBgStatus'),
-    cloudRefreshBtn: document.getElementById('cloudRefreshBtn'),
-    cloudUploadBtn: document.getElementById('cloudUploadBtn'),
     backgroundImageInput: document.getElementById('backgroundImageInput'),
     backgroundUrlInput: document.getElementById('backgroundUrlInput'),
     backgroundOpacity: document.getElementById('backgroundOpacity'),
@@ -625,9 +666,6 @@ const els = {
     closeSettingsBtn: document.getElementById('closeSettingsBtn'),
     applySettingsBtn: document.getElementById('applySettingsBtn'),
     exportDataBtn: document.getElementById('exportDataBtn'),
-    remotePushBtn: document.getElementById('remotePushBtn'),
-    remoteMergeBtn: document.getElementById('remoteMergeBtn'),
-    remotePullBtn: document.getElementById('remotePullBtn'),
     clearBackgroundBtn: document.getElementById('clearBackgroundBtn'),
     
     // Radio
@@ -638,21 +676,12 @@ const els = {
     importDataInput: document.getElementById('importDataInput'),
     importSourceSelect: document.getElementById('importSource'),
     importModeSelect: document.getElementById('importMode'),
-    webdavEndpoint: document.getElementById('webdavEndpoint'),
-    webdavUsername: document.getElementById('webdavUsername'),
-    webdavPassword: document.getElementById('webdavPassword'),
-    gistToken: document.getElementById('gistToken'),
-    gistId: document.getElementById('gistId'),
-    gistFilename: document.getElementById('gistFilename'),
 
     // Info blocks
     browserStorageInfo: document.getElementById('browserStorageInfo'),
-    syncStorageInfo: document.getElementById('syncStorageInfo'),
-    webdavStorageInfo: document.getElementById('webdavStorageInfo'),
-    gistStorageInfo: document.getElementById('gistStorageInfo'),
-    webdavConfig: document.getElementById('webdavConfig'),
-    gistConfig: document.getElementById('gistConfig'),
-    remoteActions: document.getElementById('remoteActions'),
+
+    // 自定义域名
+    customDomainInput: document.getElementById('customDomainInput'),
     
     // 书签搜索
     bookmarkSearchInput: document.getElementById('bookmarkSearchInput'),
@@ -662,6 +691,107 @@ const els = {
     searchResultsCount: document.getElementById('searchResultsCount')
 };
 
+function isMobileLayout() {
+    return window.innerWidth < MOBILE_LAYOUT_BREAKPOINT;
+}
+
+function shouldEnableDragByPointerType(pointerType) {
+    // iOS/iPadOS Safari 在 touch 指针下对 draggable 支持不稳定，
+    // 会影响点击与滚动，触摸场景关闭拖拽激活，仅保留鼠标/触控笔。
+    return pointerType === 'mouse' || pointerType === 'pen';
+}
+
+function updateMobileSidebarTopOffset() {
+    const root = document.documentElement;
+    if (!root) return;
+    const defaultTop = 94;
+    if (!els.header) {
+        root.style.setProperty('--mobile-sidebar-top', `${defaultTop}px`);
+        return;
+    }
+    const rect = els.header.getBoundingClientRect();
+    const calculatedTop = Number.isFinite(rect.bottom)
+        ? Math.max(defaultTop, Math.round(rect.bottom + 8))
+        : defaultTop;
+    root.style.setProperty('--mobile-sidebar-top', `${calculatedTop}px`);
+}
+
+function updateSidebarToggleButton() {
+    if (!els.sidebarToggleBtn) return;
+    const expanded = isMobileLayout() && isMobileSidebarOpen;
+    els.sidebarToggleBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    els.sidebarToggleBtn.setAttribute('aria-label', expanded ? '收起分类栏' : '显示分类栏');
+    els.sidebarToggleBtn.textContent = expanded ? '✕ 收起' : '☰ 分类';
+}
+
+function applyResponsiveSidebarState() {
+    const mobile = isMobileLayout();
+    if (!mobile) {
+        isMobileSidebarOpen = false;
+        document.body.classList.remove('sidebar-open');
+    } else {
+        document.body.classList.toggle('sidebar-open', isMobileSidebarOpen);
+    }
+    updateSidebarToggleButton();
+}
+
+function syncResponsiveLayout() {
+    updateMobileSidebarTopOffset();
+    applyResponsiveSidebarState();
+}
+
+function scheduleResponsiveLayoutSync() {
+    if (responsiveLayoutFrame) return;
+    responsiveLayoutFrame = requestAnimationFrame(() => {
+        responsiveLayoutFrame = null;
+        syncResponsiveLayout();
+    });
+}
+
+function openMobileSidebar() {
+    if (!isMobileLayout()) return;
+    isMobileSidebarOpen = true;
+    applyResponsiveSidebarState();
+}
+
+function closeMobileSidebar(options = {}) {
+    const { focusToggle = false } = options;
+    isMobileSidebarOpen = false;
+    applyResponsiveSidebarState();
+    if (focusToggle && els.sidebarToggleBtn) {
+        els.sidebarToggleBtn.focus();
+    }
+}
+
+function toggleMobileSidebar(forceOpen) {
+    const nextOpen = typeof forceOpen === 'boolean' ? forceOpen : !isMobileSidebarOpen;
+    if (nextOpen) {
+        openMobileSidebar();
+    } else {
+        closeMobileSidebar();
+    }
+}
+
+function setupLocalOnlyUi() {
+    appSettings.storageMode = STORAGE_MODES.BROWSER;
+    appSettings.background = normalizeBackgroundSettings(appSettings.background);
+
+    const browserRadio = Array.from(els.storageModeRadios || []).find(r => r.value === STORAGE_MODES.BROWSER);
+    if (browserRadio) {
+        browserRadio.checked = true;
+        browserRadio.disabled = false;
+    }
+
+    toggleSettingsSection(els.browserStorageInfo, true);
+
+    if (els.bgSourceTip) {
+        els.bgSourceTip.textContent = '本地模式：所有数据保存在当前网站的数据库中，可通过导出 JSON 迁移。';
+    }
+    if (els.applySettingsBtn) {
+        els.applySettingsBtn.textContent = '保存';
+    }
+}
+
 // 初始化
 document.addEventListener('DOMContentLoaded', async () => {
     await initializeApp();
@@ -670,7 +800,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 async function initializeApp() {
     syncThemeWithSystem();
     
-    // 并行加载所有本地数据（设置、背景图、缓存、数据）
+    // 并行加载所有本地数据（设置、历史背景图、缓存、数据）
     const localDataPromise = new Promise(resolve => {
         chrome.storage.local.get([
             STORAGE_KEYS.SETTINGS,
@@ -686,24 +816,25 @@ async function initializeApp() {
     // 2. 初始化设置
     if (localResult[STORAGE_KEYS.SETTINGS]) {
         appSettings = mergeSettingsWithDefaults(localResult[STORAGE_KEYS.SETTINGS]);
-        // 恢复分离存储的背景图
-        if (appSettings.background.mode === 'local' && localResult[STORAGE_KEYS.BACKGROUND_IMAGE]) {
-            if (!appSettings.background.image || appSettings.background.image === 'Check_STORAGE_KEYS_BACKGROUND_IMAGE') {
-                appSettings.background.image = localResult[STORAGE_KEYS.BACKGROUND_IMAGE];
-            }
-        }
     } else {
         appSettings = mergeSettingsWithDefaults();
-        saveSettings();
     }
+    appSettings = restoreLegacyBackgroundImage(appSettings, localResult[STORAGE_KEYS.BACKGROUND_IMAGE]);
 
+    setupLocalOnlyUi();
+    saveSettings();
     applyUiOpacity(appSettings.uiOpacity);
     
-    pendingStorageMode = appSettings.storageMode || STORAGE_MODES.BROWSER;
-    remoteActionsEnabled = isRemoteMode(pendingStorageMode);
+    pendingStorageMode = STORAGE_MODES.BROWSER;
     
     // 3. 初始化图标缓存
-    iconCache = localResult[CACHE_KEYS.ICONS] || {};
+    const { cache: normalizedCache, changed: iconCacheChanged } = normalizeIconCacheMap(
+        localResult[CACHE_KEYS.ICONS] || {}
+    );
+    iconCache = normalizedCache;
+    if (iconCacheChanged) {
+        saveIconCache();
+    }
 
     // 4. 先用本地数据准备界面（但不渲染）
     const localSnapshot = localResult[STORAGE_KEYS.DATA];
@@ -725,6 +856,7 @@ async function initializeApp() {
         updateSearchPlaceholder(appSettings.searchEngine || 'google');
     }
     setupEventListeners();
+    syncResponsiveLayout();
     updateBackgroundControlsUI();
 
     // 6. 等待背景图准备完成
@@ -743,69 +875,11 @@ async function initializeApp() {
         });
     }
 
-    // 8. 后台异步加载远端数据（不阻塞界面）
-    if (isRemoteMode(appSettings.storageMode)) {
-        syncRemoteDataInBackground(localSnapshot);
-    }
-
-    // 9. 图标缓存已在编辑时按需获取，无需批量预热
-    // warmIconCacheForBookmarks();
-    
-    // 10. 如果是云端背景模式，后台检查更新
-    if (appSettings.background?.mode === 'cloud') {
-        refreshCloudBackgroundFromRemote({ notifyWhenMissing: false });
-    }
-}
-
-// 后台同步远端数据，不阻塞界面渲染
-async function syncRemoteDataInBackground(localSnapshot) {
-    try {
-        const mode = appSettings.storageMode;
-        let remoteData = null;
-        
-        if (mode === STORAGE_MODES.WEBDAV) {
-            remoteData = await loadDataFromWebDAV({ localFallback: localSnapshot, notifyOnError: false });
-        } else if (mode === STORAGE_MODES.GIST) {
-            remoteData = await loadDataFromGist({ localFallback: localSnapshot, notifyOnError: false });
-        }
-        
-        if (remoteData && Array.isArray(remoteData.categories)) {
-            // 使用更完整的数据比较（包含所有关键字段）
-            const localHash = computeDataHash(localSnapshot);
-            const remoteHash = computeDataHash(remoteData);
-            const currentHash = computeDataHash(appData);
-            
-            // 只有当远程数据与当前内存数据不同时才更新
-            if (remoteHash !== currentHash) {
-                // 保留用户当前选择的分类（如果在新数据中仍然存在）
-                const userSelectedCategory = appData.activeCategory;
-                const categoryStillExists = remoteData.categories.some(c => c.id === userSelectedCategory);
-                
-                // 远端有更新，更新本地数据并重新渲染
-                appData = remoteData;
-                ensureActiveCategory();
-                
-                // 优先保留用户已选择的分类，只有当该分类不存在时才回退到第一个
-                if (categoryStillExists) {
-                    appData.activeCategory = userSelectedCategory;
-                } else if (appData.categories && appData.categories.length > 0) {
-                    appData.activeCategory = appData.categories[0].id;
-                }
-                renderApp({ skipAnimation: true });
-            }
-            
-            // 同步背景设置（不重复加载已有背景）
-            maybeSyncBackgroundFromDataQuiet(remoteData);
-            maybeSyncUiOpacityFromData(remoteData, { saveSettingsFlag: true });
-            attachBackgroundToData(appData);
-            
-            // 确保本地存储与远程同步（即使数据相同也更新，确保一致性）
-            if (remoteHash !== localHash) {
-                await persistDataToArea(chrome.storage.local, appData);
-            }
-        }
-    } catch (error) {
-        console.warn('后台同步远端数据失败', error);
+    // 8. 图标缓存已在编辑时按需获取，无需批量预热
+    if (LOCAL_ONLY_MODE) {
+        setTimeout(() => {
+            warmIconCacheForBookmarks();
+        }, 600);
     }
 }
 
@@ -814,27 +888,16 @@ function maybeSyncBackgroundFromDataQuiet(data) {
     const bg = extractBackgroundFromData(data);
     if (!bg) return false;
     const current = normalizeBackgroundSettings(appSettings.background);
-    
-    // 如果背景模式和关键信息相同，不重新加载
-    const isSameBackground = 
-        current.mode === bg.mode &&
+    const isSameBackground =
         current.image === bg.image &&
-        current.cloud?.downloadUrl === bg.cloud?.downloadUrl &&
-        current.cloud?.fileName === bg.cloud?.fileName;
+        current.source === bg.source &&
+        current.opacity === bg.opacity;
     
     if (isSameBackground) {
-        // 只更新设置，不重新应用背景
-        appSettings.background = normalizeBackgroundSettings({
-            ...current,
-            ...bg,
-            image: bg.image || current.image,
-            cloud: { ...current.cloud, ...(bg.cloud || {}) }
-        });
+        appSettings.background = normalizeBackgroundSettings({ ...current, ...bg });
         saveSettings();
         return false;
     }
-    
-    // 背景确实不同，才重新加载
     return maybeSyncBackgroundFromData(data, { saveSettingsFlag: true });
 }
 
@@ -872,10 +935,6 @@ async function checkAndSyncLatestData() {
             maybeSyncUiOpacityFromData(localSnapshot, { saveSettingsFlag: true });
         }
         
-        // 如果是远程模式，后台检查远程更新
-        if (isRemoteMode(appSettings.storageMode)) {
-            syncRemoteDataInBackground(localSnapshot);
-        }
     } catch (error) {
         console.warn('检查数据更新失败', error);
     }
@@ -888,7 +947,10 @@ function computeDataHash(data) {
         // 只比较关键字段，忽略运行时状态
         const keyData = {
             categories: data.categories,
-            activeCategory: data.activeCategory
+            activeCategory: data.activeCategory,
+            // 包含背景相关字段，确保跨设备仅背景变更时也能被检测到
+            background: normalizeBackgroundSettings(data.background),
+            uiOpacity: normalizeUiOpacity(data.uiOpacity)
         };
         return JSON.stringify(keyData);
     } catch (e) {
@@ -909,21 +971,37 @@ function updateSearchPlaceholder(engine) {
 
 // --- 数据操作 ---
 
+function restoreLegacyBackgroundImage(settings, legacyImage) {
+    const mergedSettings = mergeSettingsWithDefaults(settings);
+    const legacy = typeof legacyImage === 'string' ? legacyImage : '';
+    if (!legacy) return mergedSettings;
+
+    const background = normalizeBackgroundSettings(mergedSettings.background);
+    const needsRestore = !background.image || background.image === LEGACY_BG_PLACEHOLDER;
+    if (!needsRestore) {
+        return mergedSettings;
+    }
+
+    return {
+        ...mergedSettings,
+        background: normalizeBackgroundSettings({
+            ...background,
+            image: legacy
+        })
+    };
+}
+
 async function loadSettings() {
     return new Promise((resolve) => {
         chrome.storage.local.get([STORAGE_KEYS.SETTINGS, STORAGE_KEYS.BACKGROUND_IMAGE], (result) => {
             if (result[STORAGE_KEYS.SETTINGS]) {
-                appSettings = mergeSettingsWithDefaults(result[STORAGE_KEYS.SETTINGS]);
-                // 恢复分离存储的背景图
-                if (appSettings.background.mode === 'local' && result[STORAGE_KEYS.BACKGROUND_IMAGE]) {
-                    if (!appSettings.background.image || appSettings.background.image === 'Check_STORAGE_KEYS_BACKGROUND_IMAGE') {
-                        appSettings.background.image = result[STORAGE_KEYS.BACKGROUND_IMAGE];
-                    }
-                }
+                appSettings = restoreLegacyBackgroundImage(result[STORAGE_KEYS.SETTINGS], result[STORAGE_KEYS.BACKGROUND_IMAGE]);
             } else {
                 appSettings = mergeSettingsWithDefaults();
                 saveSettings();
             }
+            // 确保 customDomain 同步到 localStorage
+            syncCustomDomainToLocalStorage(appSettings.customDomain);
             applyUiOpacity(appSettings.uiOpacity);
             applyBackgroundFromSettings();
             updateBackgroundControlsUI();
@@ -933,45 +1011,69 @@ async function loadSettings() {
 }
 
 function saveSettings() {
-    const settingsToSave = deepClone(appSettings);
-    let bgImageToSave = null;
-
-    // 如果是本地模式且有图片数据，分离存储
-    if (settingsToSave.background && settingsToSave.background.mode === 'local') {
-        const img = settingsToSave.background.image;
-        // 仅当图片数据较大时才分离，避免小图片也分离增加复杂度（虽然这里统一分离逻辑更清晰，但为了兼容性...）
-        // 这里选择只要有内容就分离，保持逻辑一致性
-        if (img && img.length > 100) { 
-            bgImageToSave = img;
-            settingsToSave.background.image = 'Check_STORAGE_KEYS_BACKGROUND_IMAGE';
-        }
-    }
-
-    const updates = {
-        [STORAGE_KEYS.SETTINGS]: settingsToSave
-    };
-    
-    if (bgImageToSave !== null) {
-        updates[STORAGE_KEYS.BACKGROUND_IMAGE] = bgImageToSave;
-    } else if (settingsToSave.background.mode !== 'local') {
-        // 如果切换到了云端模式，可以选择清理本地背景图，或者保留以便快速切换回来
-        // 这里不做删除操作，以免用户误操作切换模式后丢失本地图片
-    }
-
-    chrome.storage.local.set(updates, () => {
+    const settingsToSave = mergeSettingsWithDefaults(deepClone(appSettings));
+    // 同步 customDomain 到 localStorage，以便 chrome-adapter.js 启动时能同步读取
+    syncCustomDomainToLocalStorage(settingsToSave.customDomain);
+    chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: settingsToSave }, () => {
         if (chrome.runtime.lastError) {
             console.warn('保存设置失败:', chrome.runtime.lastError);
+            return;
         }
+        // 清理历史拆分字段，避免再次回退到旧逻辑
+        chrome.storage.local.remove([STORAGE_KEYS.BACKGROUND_IMAGE], () => {});
     });
+}
+
+/**
+ * 将 customDomain 同步到 localStorage，用于 chrome-adapter.js 启动时同步读取。
+ */
+function syncCustomDomainToLocalStorage(domain) {
+    try {
+        if (domain) {
+            localStorage.setItem('WebNav_customDomain', domain.trim());
+        } else {
+            localStorage.removeItem('WebNav_customDomain');
+        }
+    } catch (_) {}
 }
 
 async function loadIconCache() {
     return new Promise((resolve) => {
         chrome.storage.local.get([CACHE_KEYS.ICONS], (result) => {
-            iconCache = result[CACHE_KEYS.ICONS] || {};
+            const { cache: normalizedCache, changed } = normalizeIconCacheMap(
+                result[CACHE_KEYS.ICONS] || {}
+            );
+            iconCache = normalizedCache;
+            if (changed) {
+                saveIconCache();
+            }
             resolve();
         });
     });
+}
+
+function normalizeIconCacheMap(rawCache) {
+    if (!rawCache || typeof rawCache !== 'object') {
+        return { cache: {}, changed: false };
+    }
+    const cache = {};
+    let changed = false;
+    Object.entries(rawCache).forEach(([key, value]) => {
+        if (!key || typeof key !== 'string') {
+            changed = true;
+            return;
+        }
+        if (!value || typeof value !== 'string') {
+            changed = true;
+            return;
+        }
+        const normalizedValue = normalizePersistedAssetUrl(value);
+        if (normalizedValue !== value) {
+            changed = true;
+        }
+        cache[key] = normalizedValue;
+    });
+    return { cache, changed };
 }
 
 let saveIconCacheTimer = null;
@@ -998,39 +1100,14 @@ function saveIconCache() {
 }
 
 async function loadData(options = {}) {
-    const mode = options.mode || appSettings.storageMode || STORAGE_MODES.BROWSER;
     const localSnapshot = options.localSnapshot !== undefined
         ? options.localSnapshot
         : await readLocalDataSnapshot();
     const fallback = localSnapshot || deepClone(DEFAULT_DATA);
 
-    if (mode === STORAGE_MODES.SYNC) {
-        await new Promise((resolve) => {
-            chrome.storage.sync.get([STORAGE_KEYS.DATA], (syncResult) => {
-                if (syncResult[STORAGE_KEYS.DATA]) {
-                    appData = syncResult[STORAGE_KEYS.DATA];
-                } else {
-                    appData = fallback;
-                    persistDataToArea(chrome.storage.sync, appData);
-                }
-                resolve();
-            });
-        });
-    } else if (mode === STORAGE_MODES.WEBDAV) {
-        appData = await loadDataFromWebDAV({
-            localFallback: fallback,
-            notifyOnError: options.notifyOnError
-        });
-    } else if (mode === STORAGE_MODES.GIST) {
-        appData = await loadDataFromGist({
-            localFallback: fallback,
-            notifyOnError: options.notifyOnError
-        });
-    } else {
-        appData = fallback;
-        if (!localSnapshot) {
-            await persistDataToArea(chrome.storage.local, appData);
-        }
+    appData = fallback;
+    if (!localSnapshot) {
+        await persistDataToArea(chrome.storage.local, appData);
     }
 
     maybeSyncBackgroundFromData(appData, { saveSettingsFlag: true });
@@ -1039,9 +1116,7 @@ async function loadData(options = {}) {
     ensureActiveCategory();
     const normalized = normalizeDataStructure();
     if (normalized) {
-        await persistAppData(appData, { mode, notifyOnError: false });
-    } else if (isRemoteMode(mode)) {
-        await persistDataToArea(chrome.storage.local, appData);
+        await persistAppData(appData, { notifyOnError: false });
     }
     purgeUnusedCachedIcons();
 }
@@ -1143,32 +1218,6 @@ async function saveData(options = {}) {
 
 async function persistAppData(data, { mode = appSettings.storageMode, notifyOnError = false } = {}) {
     const dataWithBackground = attachBackgroundToData(data);
-    const targetMode = mode || STORAGE_MODES.BROWSER;
-    if (targetMode === STORAGE_MODES.WEBDAV) {
-        await persistDataToArea(chrome.storage.local, dataWithBackground);
-        try {
-            await saveDataToWebDAV(dataWithBackground);
-        } catch (error) {
-            handleRemoteError(`保存到 WebDAV 失败：${error.message}`, notifyOnError, 'webdav');
-        }
-        return;
-    }
-    if (targetMode === STORAGE_MODES.GIST) {
-        await persistDataToArea(chrome.storage.local, dataWithBackground);
-        try {
-            await saveDataToGist(dataWithBackground);
-        } catch (error) {
-            handleRemoteError(`保存到 Gist 失败：${error.message}`, notifyOnError, 'gist');
-        }
-        return;
-    }
-    if (targetMode === STORAGE_MODES.SYNC) {
-        await Promise.all([
-            persistDataToArea(chrome.storage.sync, dataWithBackground),
-            persistDataToArea(chrome.storage.local, dataWithBackground)
-        ]);
-        return;
-    }
     await persistDataToArea(chrome.storage.local, dataWithBackground);
 }
 
@@ -1200,262 +1249,6 @@ function ensureActiveCategory() {
     }
 }
 
-function normalizeRemoteFilename(name = '') {
-    const trimmed = (name || '').trim();
-    return trimmed || DEFAULT_REMOTE_FILENAME;
-}
-
-function parseRemoteDataPayload(payload) {
-    try {
-        const parsed = typeof payload === 'string' ? JSON.parse(payload) : payload;
-        if (parsed && Array.isArray(parsed.categories)) {
-            return parsed;
-        }
-    } catch (error) {
-        return null;
-    }
-    return null;
-}
-
-function normalizeWebdavConfig(config = {}) {
-    const base = config && typeof config === 'object' ? config : {};
-    return {
-        endpoint: (base.endpoint || '').trim(),
-        username: (base.username || '').trim(),
-        password: base.password || ''
-    };
-}
-
-function buildWebdavHeaders(config, contentType = 'application/json') {
-    const headers = {};
-    if (contentType) {
-        headers['Content-Type'] = contentType;
-    }
-    if (config.username || config.password) {
-        const token = btoa(`${config.username || ''}:${config.password || ''}`);
-        headers.Authorization = `Basic ${token}`;
-    }
-    return headers;
-}
-
-// WebDAV 请求的通用选项，阻止浏览器弹出原生认证框
-function buildWebdavFetchOptions(cfg, method, additionalHeaders = {}, body = null) {
-    const options = {
-        method,
-        headers: { ...buildWebdavHeaders(cfg, ''), ...additionalHeaders },
-        credentials: 'omit', // 关键：阻止浏览器弹出认证框
-        cache: 'no-store'
-    };
-    if (body !== null) {
-        options.body = body;
-        // 对于有 body 的请求，需要设置正确的 Content-Type
-        if (body instanceof Blob) {
-            options.headers = { ...buildWebdavHeaders(cfg, body.type || 'application/octet-stream'), ...additionalHeaders };
-        }
-    }
-    return options;
-}
-
-async function loadDataFromWebDAV({ localFallback, notifyOnError = false } = {}) {
-    const cfg = normalizeWebdavConfig(appSettings.webdav);
-    const fallback = localFallback || deepClone(DEFAULT_DATA);
-    if (!cfg.endpoint) {
-        handleRemoteError('WebDAV 未填写文件地址，已使用本地数据。', notifyOnError, 'webdav');
-        await persistDataToArea(chrome.storage.local, fallback);
-        return fallback;
-    }
-    // 防止配置不完整导致浏览器原生弹窗
-    if (!cfg.username && !cfg.password) {
-        console.warn('WebDAV 配置不完整（缺少用户名/密码），跳过自动加载以避免浏览器弹窗。');
-        if (notifyOnError) {
-            alert('WebDAV 配置不完整，请在设置中填写用户名和密码。');
-        }
-        await persistDataToArea(chrome.storage.local, fallback);
-        return fallback;
-    }
-    try {
-        const response = await fetchWithTimeout(cfg.endpoint, {
-            method: 'GET',
-            headers: buildWebdavHeaders(cfg),
-            credentials: 'omit',
-            cache: 'no-store'
-        }, REMOTE_FETCH_TIMEOUT);
-        if (response.status === 404) {
-            handleRemoteError('WebDAV 上暂未找到数据文件，保存时会自动新建。', notifyOnError, 'webdav');
-            await persistDataToArea(chrome.storage.local, fallback);
-            return fallback;
-        }
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-        const text = await response.text();
-        const parsed = parseRemoteDataPayload(text);
-        if (!parsed) {
-            throw new Error('远程数据格式不正确');
-        }
-        await persistDataToArea(chrome.storage.local, parsed);
-        return parsed;
-    } catch (error) {
-        // 网络请求失败是预期情况（离线/超时），降级为 debug 级别
-        if (isNetworkError(error)) {
-            console.debug('[WebDAV] 网络不可用，使用本地数据');
-        } else {
-            console.warn('加载 WebDAV 数据失败', error);
-        }
-        handleRemoteError(`读取 WebDAV 失败，已使用本地数据。${error.message}`, notifyOnError, 'webdav');
-        await persistDataToArea(chrome.storage.local, fallback);
-        return fallback;
-    }
-}
-
-async function saveDataToWebDAV(data) {
-    const cfg = normalizeWebdavConfig(appSettings.webdav);
-    if (!cfg.endpoint) {
-        throw new Error('未填写 WebDAV 文件地址');
-    }
-    const payload = JSON.stringify(data, null, 2);
-    const response = await fetchWithTimeout(cfg.endpoint, {
-        method: 'PUT',
-        headers: buildWebdavHeaders(cfg),
-        credentials: 'omit',
-        body: payload
-    }, REMOTE_FETCH_TIMEOUT);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-}
-
-function normalizeGistConfig(config = {}) {
-    const base = config && typeof config === 'object' ? config : {};
-    return {
-        token: (base.token || '').trim(),
-        gistId: (base.gistId || '').trim(),
-        filename: normalizeRemoteFilename(base.filename || DEFAULT_REMOTE_FILENAME)
-    };
-}
-
-function buildGistHeaders(token) {
-    const headers = {
-        Accept: 'application/vnd.github+json'
-    };
-    if (token) {
-        headers.Authorization = `Bearer ${token}`;
-    }
-    return headers;
-}
-
-async function loadDataFromGist({ localFallback, notifyOnError = false } = {}) {
-    const cfg = normalizeGistConfig(appSettings.gist);
-    const fallback = localFallback || deepClone(DEFAULT_DATA);
-    if (!cfg.token) {
-        handleRemoteError('未填写 Gist Token，已使用本地数据。', notifyOnError, 'gist');
-        await persistDataToArea(chrome.storage.local, fallback);
-        return fallback;
-    }
-    if (!cfg.gistId) {
-        handleRemoteError('未填写 Gist ID，已使用本地数据。保存时会自动创建新的私有 Gist。', notifyOnError, 'gist');
-        await persistDataToArea(chrome.storage.local, fallback);
-        return fallback;
-    }
-    try {
-        const response = await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-            method: 'GET',
-            headers: buildGistHeaders(cfg.token),
-            cache: 'no-store'
-        }, REMOTE_FETCH_TIMEOUT);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-        const gist = await response.json();
-        const fileMeta = gist?.files?.[cfg.filename];
-        if (!fileMeta) {
-            handleRemoteError('远程 Gist 中尚未找到数据文件，已使用本地数据。', notifyOnError, 'gist');
-            await persistDataToArea(chrome.storage.local, fallback);
-            return fallback;
-        }
-        let content = fileMeta.content || '';
-        if (fileMeta.truncated && fileMeta.raw_url) {
-            const rawResp = await fetchWithTimeout(fileMeta.raw_url, {
-                headers: buildGistHeaders(cfg.token),
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-            if (rawResp.ok) {
-                content = await rawResp.text();
-            }
-        }
-        const parsed = parseRemoteDataPayload(content);
-        if (!parsed) {
-            throw new Error('远程数据格式不正确');
-        }
-        await persistDataToArea(chrome.storage.local, parsed);
-        return parsed;
-    } catch (error) {
-        // 网络请求失败是预期情况（离线/超时），降级为 debug 级别
-        if (isNetworkError(error)) {
-            console.debug('[Gist] 网络不可用，使用本地数据');
-        } else {
-            console.warn('加载 Gist 数据失败', error);
-        }
-        handleRemoteError(`读取 Gist 失败，已使用本地数据。${error.message}`, notifyOnError, 'gist');
-        await persistDataToArea(chrome.storage.local, fallback);
-        return fallback;
-    }
-}
-
-async function saveDataToGist(data) {
-    const cfg = normalizeGistConfig(appSettings.gist);
-    if (!cfg.token) {
-        throw new Error('未填写 Gist Token');
-    }
-    const payload = JSON.stringify(data, null, 2);
-    const filename = normalizeRemoteFilename(cfg.filename);
-
-    if (!cfg.gistId) {
-        const newId = await createGist(cfg.token, filename, payload);
-        appSettings.gist.gistId = newId;
-        saveSettings();
-        if (els.gistId) {
-            els.gistId.value = newId;
-        }
-        return;
-    }
-
-    const response = await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-        method: 'PATCH',
-        headers: buildGistHeaders(cfg.token),
-        body: JSON.stringify({
-            files: {
-                [filename]: { content: payload }
-            }
-        })
-    }, REMOTE_FETCH_TIMEOUT);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-}
-
-async function createGist(token, filename, content) {
-    const response = await fetchWithTimeout('https://api.github.com/gists', {
-        method: 'POST',
-        headers: buildGistHeaders(token),
-        body: JSON.stringify({
-            description: 'MyLocalNewTab 数据同步',
-            public: false,
-            files: {
-                [filename]: { content }
-            }
-        })
-    }, REMOTE_FETCH_TIMEOUT);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-    const data = await response.json();
-    if (!data?.id) {
-        throw new Error('创建 Gist 失败');
-    }
-    return data.id;
-}
-
 // 判断是否为网络相关错误（离线、超时、连接失败等）
 function isNetworkError(error) {
     if (!error) return false;
@@ -1472,7 +1265,7 @@ function isNetworkError(error) {
     );
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = REMOTE_FETCH_TIMEOUT) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = NETWORK_FETCH_TIMEOUT) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -1488,187 +1281,84 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = REMOTE_FETCH_TIME
     }
 }
 
-function handleRemoteError(message, notify = false, key = '') {
-    console.warn(message);
-    if (!notify) return;
-    if (key) {
-        if (syncWarningState[key]) return;
-        syncWarningState[key] = true;
-        setTimeout(() => {
-            syncWarningState[key] = false;
-        }, 8000);
-    }
-    alert(message);
-}
-
-async function testRemoteConnectivity(mode) {
-    if (mode === STORAGE_MODES.WEBDAV) {
-        return testWebdavConnectivity();
-    }
-    if (mode === STORAGE_MODES.GIST) {
-        return testGistConnectivity();
-    }
-    return true;
-}
-
-async function testWebdavConnectivity() {
-    const cfg = normalizeWebdavConfig(appSettings.webdav);
-    if (!cfg.endpoint) return false;
-    try {
-        const response = await fetchWithTimeout(cfg.endpoint, {
-            method: 'GET',
-            headers: buildWebdavHeaders(cfg),
-            credentials: 'omit',
-            cache: 'no-store'
-        }, REMOTE_FETCH_TIMEOUT);
-        return response.ok || response.status === 404;
-    } catch (error) {
-        console.warn('WebDAV 配置检测失败', error);
-        return false;
-    }
-}
-
-async function testGistConnectivity() {
-    const cfg = normalizeGistConfig(appSettings.gist);
-    if (!cfg.token) return false;
-    try {
-        if (cfg.gistId) {
-            const response = await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-                method: 'GET',
-                headers: buildGistHeaders(cfg.token),
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-            return response.ok;
-        }
-        const response = await fetchWithTimeout('https://api.github.com/gists?per_page=1', {
-            method: 'GET',
-            headers: buildGistHeaders(cfg.token),
-            cache: 'no-store'
-        }, REMOTE_FETCH_TIMEOUT);
-        return response.ok;
-    } catch (error) {
-        console.warn('Gist 配置检测失败', error);
-        return false;
-    }
-}
-
-async function fetchRemoteSnapshot(mode) {
-    if (mode === STORAGE_MODES.WEBDAV) {
-        return fetchWebdavSnapshot();
-    }
-    if (mode === STORAGE_MODES.GIST) {
-        return fetchGistSnapshot();
-    }
-    return null;
-}
-
-async function fetchWebdavSnapshot() {
-    const cfg = normalizeWebdavConfig(appSettings.webdav);
-    if (!cfg.endpoint) {
-        throw new Error('未填写 WebDAV 文件地址');
-    }
-    const response = await fetchWithTimeout(cfg.endpoint, {
-        method: 'GET',
-        headers: buildWebdavHeaders(cfg),
-        credentials: 'omit',
-        cache: 'no-store'
-    }, REMOTE_FETCH_TIMEOUT);
-    if (response.status === 404) {
-        return null;
-    }
+async function persistBlobAsset(blob, { fileName = '', sourceUrl = '' } = {}) {
+    if (!blob || !(blob instanceof Blob) || blob.size <= 0) return '';
+    const query = new URLSearchParams();
+    if (fileName) query.set('filename', fileName);
+    if (sourceUrl) query.set('source_url', sourceUrl);
+    const response = await fetchWithTimeout(resolveApiUrl(`/api/assets?${query.toString()}`), {
+        method: 'POST',
+        headers: {
+            'Content-Type': blob.type || 'application/octet-stream'
+        },
+        body: blob
+    }, NETWORK_FETCH_TIMEOUT);
     if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        let message = `HTTP ${response.status}`;
+        try {
+            const err = await response.json();
+            if (err?.error) message = err.error;
+        } catch (error) {
+            // ignore parse failure
+        }
+        throw new Error(message);
     }
-    const text = await response.text();
-    const parsed = parseRemoteDataPayload(text);
-    if (!parsed) {
-        throw new Error('远程数据格式不正确');
-    }
-    return parsed;
+    const data = await response.json();
+    return normalizePersistedAssetUrl(data?.path || data?.url || '');
 }
 
-async function fetchGistSnapshot() {
-    const cfg = normalizeGistConfig(appSettings.gist);
-    if (!cfg.token) {
-        throw new Error('未填写 Gist Token');
-    }
-    if (!cfg.gistId) {
-        throw new Error('未填写 Gist ID');
-    }
-    const response = await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-        method: 'GET',
-        headers: buildGistHeaders(cfg.token),
-        cache: 'no-store'
-    }, REMOTE_FETCH_TIMEOUT);
+async function persistDataUrlAsset(dataUrl, options = {}) {
+    const blob = dataUrlToBlob(dataUrl);
+    if (!blob) return '';
+    return persistBlobAsset(blob, options);
+}
+
+async function fetchExternalAssetToLocal(sourceUrl, { maxBytes = DEFAULT_EXTERNAL_FETCH_MAX_BYTES } = {}) {
+    const response = await fetchWithTimeout(resolveApiUrl('/api/assets/fetch'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            url: sourceUrl,
+            maxBytes
+        })
+    }, NETWORK_FETCH_TIMEOUT);
     if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-    const gist = await response.json();
-    const fileMeta = gist?.files?.[normalizeRemoteFilename(cfg.filename)];
-    if (!fileMeta) {
-        return null;
-    }
-    let content = fileMeta.content || '';
-    if (fileMeta.truncated && fileMeta.raw_url) {
-        const rawResp = await fetchWithTimeout(fileMeta.raw_url, {
-            headers: buildGistHeaders(cfg.token),
-            cache: 'no-store'
-        }, REMOTE_FETCH_TIMEOUT);
-        if (rawResp.ok) {
-            content = await rawResp.text();
+        let message = `HTTP ${response.status}`;
+        try {
+            const err = await response.json();
+            if (err?.error) message = err.error;
+        } catch (error) {
+            // ignore parse failure
         }
+        throw new Error(message);
     }
-    const parsed = parseRemoteDataPayload(content);
-    if (!parsed) {
-        throw new Error('远程数据格式不正确');
-    }
-    return parsed;
+    const data = await response.json();
+    return normalizePersistedAssetUrl(data?.path || data?.url || '');
 }
 
-async function handleRemoteSyncAction(action) {
-    if (!remoteActionsEnabled || !isRemoteMode(pendingStorageMode)) {
-        alert('请先点击“应用配置”验证远程设置。');
-        return;
-    }
-    const mode = pendingStorageMode;
-    syncSettingsFromUI();
-    saveSettings();
-
+async function fetchExternalTextViaProxy(sourceUrl, { maxBytes = DEFAULT_EXTERNAL_TEXT_FETCH_MAX_BYTES } = {}) {
     try {
-        if (action === 'push') {
-            appSettings.storageMode = mode;
-            saveSettings();
-            await persistAppData(appData, { mode, notifyOnError: true });
-            alert('已将本地数据覆盖上传，并切换到远程模式。');
-            return;
+        const response = await fetchWithTimeout(resolveApiUrl('/api/fetch/text'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                url: sourceUrl,
+                maxBytes
+            })
+        }, NETWORK_FETCH_TIMEOUT);
+        if (!response.ok) {
+            return null;
         }
-
-        const remoteData = await fetchRemoteSnapshot(mode);
-        if (action === 'pull') {
-            if (!remoteData) {
-                alert('云端暂无数据可覆盖。');
-                return;
-            }
-            appData = remoteData;
-        } else if (action === 'merge') {
-            const merged = remoteData ? mergeImportedData(appData, remoteData) : appData;
-            appData = merged;
-        }
-
-        maybeSyncBackgroundFromData(appData, { saveSettingsFlag: true });
-        maybeSyncUiOpacityFromData(appData, { saveSettingsFlag: true });
-        attachBackgroundToData(appData);
-        ensureActiveCategory();
-        normalizeDataStructure();
-        appSettings.storageMode = mode;
-        saveSettings();
-        await persistAppData(appData, { mode, notifyOnError: true });
-        renderApp();
-        // 图标缓存已在编辑时按需获取，无需批量预热
-        alert(action === 'merge' ? '合并并上传完成，已生效。' : '已用云端数据覆盖本地并生效。');
+        const data = await response.json();
+        const text = typeof data?.text === 'string' ? data.text : '';
+        if (!text) return null;
+        return {
+            text,
+            finalUrl: data?.finalUrl || sourceUrl,
+            contentType: data?.contentType || ''
+        };
     } catch (error) {
-        console.error('远程同步失败', error);
-        alert(`同步失败：${error.message}`);
+        return null;
     }
 }
 
@@ -1683,9 +1373,24 @@ function normalizeDataStructure() {
                     changed = true;
                 }
             }
+            const normalizedIcon = normalizePersistedAssetUrl(bm.icon || '');
+            if ((bm.icon || '') !== normalizedIcon) {
+                bm.icon = normalizedIcon;
+                changed = true;
+            }
             if (!Array.isArray(bm.iconFallbacks)) {
                 bm.iconFallbacks = [];
                 changed = true;
+            } else {
+                const normalizedFallbacks = bm.iconFallbacks
+                    .map(item => (typeof item === 'string' ? normalizePersistedAssetUrl(item) : ''))
+                    .filter(Boolean);
+                const fallbackChanged = normalizedFallbacks.length !== bm.iconFallbacks.length ||
+                    normalizedFallbacks.some((item, index) => item !== bm.iconFallbacks[index]);
+                if (fallbackChanged) {
+                    bm.iconFallbacks = normalizedFallbacks;
+                    changed = true;
+                }
             }
             // Only fill missing favicon data; do not overwrite user-chosen icon/fallbacks.
             if (bm.iconType === 'favicon' && (!bm.icon || bm.iconFallbacks.length === 0)) {
@@ -1696,12 +1401,27 @@ function normalizeDataStructure() {
             }
         });
     });
+    const normalizedBg = normalizeBackgroundSettings(appData.background);
+    const currentBg = appData.background || {};
+    const bgChanged =
+        !currentBg ||
+        currentBg.image !== normalizedBg.image ||
+        currentBg.opacity !== normalizedBg.opacity ||
+        (currentBg.source || currentBg.sourceUrl || '') !== normalizedBg.source;
+    if (bgChanged) {
+        appData.background = normalizedBg;
+        changed = true;
+    }
     return changed;
 }
 
 function resolveCachedIconSrc(src) {
     if (!src) return '';
-    return (iconCache && iconCache[src]) || src;
+    const normalizedSrc = normalizePersistedAssetUrl(src);
+    const cached = (iconCache && (iconCache[src] || iconCache[normalizedSrc])) || '';
+    const resolved = normalizePersistedAssetUrl(cached || normalizedSrc || src);
+    // 如果结果是本地资源路径，使用自定义域名拼接完整 URL
+    return resolveAssetDisplayUrl(resolved);
 }
 
 function dedupeIconList(primary, list) {
@@ -1725,14 +1445,33 @@ function resolveBookmarkIconSource(bookmark) {
 }
 
 async function cacheIconIfNeeded(src) {
-    const isLocalAsset = src.startsWith('icons/') || src.startsWith('chrome-extension://') || src.startsWith('moz-extension://') || src.startsWith('/');
-    if (!src || src.startsWith('data:') || isLocalAsset || (iconCache && iconCache[src])) {
+    const normalizedSrc = normalizePersistedAssetUrl(src);
+    const targetSrc = normalizedSrc || src;
+    const isPersistedLocalAsset = isPersistedAssetReference(targetSrc);
+    const isLocalAsset = targetSrc.startsWith('icons/') ||
+        targetSrc.startsWith('chrome-extension://') ||
+        targetSrc.startsWith('moz-extension://') ||
+        targetSrc.startsWith('/') ||
+        isPersistedLocalAsset;
+    if (!targetSrc || targetSrc.startsWith('data:') || isLocalAsset || (iconCache && (iconCache[targetSrc] || iconCache[src]))) {
         return false;
     }
+
+    try {
+        const persistedUrl = await fetchExternalAssetToLocal(targetSrc, { maxBytes: MAX_CACHED_ICON_BYTES });
+        if (persistedUrl) {
+            iconCache[targetSrc] = normalizePersistedAssetUrl(persistedUrl);
+            saveIconCache();
+            return true;
+        }
+    } catch (error) {
+        // 失败后回退到浏览器直接拉取（受 CORS 影响）
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 8000); // 8秒超时
     try {
-        const response = await fetch(src, { 
+        const response = await fetch(targetSrc, { 
             mode: 'cors', 
             cache: 'force-cache',
             signal: controller.signal
@@ -1747,16 +1486,16 @@ async function cacheIconIfNeeded(src) {
         if (!blob || blob.size > MAX_CACHED_ICON_BYTES) {
             return false;
         }
-        const dataUrl = await blobToDataURL(blob);
-        if (dataUrl) {
-            iconCache[src] = dataUrl;
+        const persistedUrl = await persistBlobAsset(blob, { fileName: '', sourceUrl: targetSrc });
+        if (persistedUrl) {
+            iconCache[targetSrc] = normalizePersistedAssetUrl(persistedUrl);
             saveIconCache();
             return true;
         }
     } catch (error) {
         // 如果是主动中止则静默处理，否则打印警告
         if (error.name !== 'AbortError') {
-            console.warn('缓存图标失败', src, error);
+            console.warn('缓存图标失败', targetSrc, error);
         }
     } finally {
         clearTimeout(timeoutId);
@@ -1978,6 +1717,9 @@ function setupCategoryDragHandlers(li, categoryId) {
         li.draggable = false;
     };
     const startLongPress = (event) => {
+        if (!shouldEnableDragByPointerType(event.pointerType)) {
+            return;
+        }
         if (appData.categories.length <= 1) return;
         if ((event.pointerType === 'mouse' && event.button !== 0) || event.target.closest('.delete-cat')) {
             return;
@@ -2090,6 +1832,9 @@ function renderCategories(options = {}) {
                 closeFolderModal();
             }
             renderApp();
+            if (isMobileLayout()) {
+                closeMobileSidebar();
+            }
         };
         // 右键菜单
         li.addEventListener('contextmenu', (e) => {
@@ -2690,6 +2435,9 @@ function setupBookmarkCardDrag(card, bookmarkId, context = {}) {
     };
 
     const startLongPress = (event) => {
+        if (!shouldEnableDragByPointerType(event.pointerType)) {
+            return;
+        }
         // 批量选择模式下禁用拖拽
         if (batchSelectState.enabled) {
             return;
@@ -5175,10 +4923,13 @@ async function _safeFetch(url, options = {}) {
  */
 async function _fetchText(url) {
     const resp = await _safeFetch(url);
-    if (!resp || !resp.ok) return null;
-    const ct = resp.headers.get('Content-Type') || '';
-    const text = await resp.text();
-    return { text, finalUrl: resp.url, contentType: ct };
+    if (resp && resp.ok) {
+        const ct = resp.headers.get('Content-Type') || '';
+        const text = await resp.text();
+        return { text, finalUrl: resp.url, contentType: ct };
+    }
+    // Fallback: use backend proxy to bypass CORS and preserve redirect final URL.
+    return fetchExternalTextViaProxy(url, { maxBytes: DEFAULT_EXTERNAL_TEXT_FETCH_MAX_BYTES });
 }
 
 // ----- HTML <link> / <meta> parsing -----
@@ -5447,11 +5198,13 @@ function _probeImageSize(url) {
  * 7. Return unified candidate list with sizesHint populated.
  */
 async function fetchIconCandidates(urlObj) {
-    const origin = urlObj.origin;
-    const hostname = urlObj.hostname;
+    const inputOrigin = urlObj.origin;
+    const inputHostname = urlObj.hostname;
     const pageUrl = urlObj.href;
 
     let allCandidates = [];
+    let resolvedOrigin = inputOrigin;
+    let resolvedHostname = inputHostname;
 
     // Step 1: try to fetch page HTML
     let manifestUrl = null;
@@ -5460,11 +5213,32 @@ async function fetchIconCandidates(urlObj) {
     const pageResult = await _fetchText(pageUrl);
     if (pageResult && pageResult.text) {
         const baseUrl = pageResult.finalUrl || pageUrl;
+        try {
+            const resolvedUrl = new URL(baseUrl);
+            resolvedOrigin = resolvedUrl.origin;
+            resolvedHostname = resolvedUrl.hostname;
+        } catch (error) {
+            // keep input origin/hostname
+        }
         const parsed = _collectFromHtml(baseUrl, pageResult.text);
         allCandidates.push(...parsed.candidates);
         manifestUrl = parsed.manifestUrl;
         browserconfigUrl = parsed.browserconfigUrl;
     }
+
+    const originsToTry = Array.from(
+        new Set([resolvedOrigin, inputOrigin].filter(Boolean))
+    );
+    const hostCandidates = [
+        { hostname: resolvedHostname, origin: resolvedOrigin },
+        { hostname: inputHostname, origin: inputOrigin },
+    ].filter(item => item.hostname);
+    const seenHost = new Set();
+    const hostnamesToTry = hostCandidates.filter(item => {
+        if (seenHost.has(item.hostname)) return false;
+        seenHost.add(item.hostname);
+        return true;
+    });
 
     // Step 2: manifest
     if (manifestUrl) {
@@ -5474,27 +5248,56 @@ async function fetchIconCandidates(urlObj) {
         }
     } else {
         // Try well-known manifest paths
-        for (const mPath of ['/site.webmanifest', '/manifest.json']) {
-            const mResult = await _fetchText(origin + mPath);
-            if (mResult && mResult.text && mResult.text.trim().startsWith('{')) {
-                allCandidates.push(..._collectFromManifest(mResult.finalUrl || (origin + mPath), mResult.text));
+        let manifestFound = false;
+        for (const targetOrigin of originsToTry) {
+            for (const mPath of ['/site.webmanifest', '/manifest.json']) {
+                const manifestCandidateUrl = targetOrigin + mPath;
+                const mResult = await _fetchText(manifestCandidateUrl);
+                if (mResult && mResult.text && mResult.text.trim().startsWith('{')) {
+                    allCandidates.push(..._collectFromManifest(mResult.finalUrl || manifestCandidateUrl, mResult.text));
+                    manifestFound = true;
+                    break;
+                }
+            }
+            if (manifestFound) {
                 break;
             }
         }
     }
 
     // Step 3: browserconfig.xml
-    const bcUrl = browserconfigUrl || (origin + '/browserconfig.xml');
-    const bcResult = await _fetchText(bcUrl);
-    if (bcResult && bcResult.text && bcResult.text.toLowerCase().includes('<browserconfig')) {
-        allCandidates.push(..._collectFromBrowserconfig(origin, bcResult.text));
+    if (browserconfigUrl) {
+        const bcResult = await _fetchText(browserconfigUrl);
+        if (bcResult && bcResult.text && bcResult.text.toLowerCase().includes('<browserconfig')) {
+            allCandidates.push(
+                ..._collectFromBrowserconfig(bcResult.finalUrl || browserconfigUrl, bcResult.text)
+            );
+        }
+    } else {
+        for (const targetOrigin of originsToTry) {
+            const browserConfigCandidateUrl = targetOrigin + '/browserconfig.xml';
+            const bcResult = await _fetchText(browserConfigCandidateUrl);
+            if (bcResult && bcResult.text && bcResult.text.toLowerCase().includes('<browserconfig')) {
+                allCandidates.push(
+                    ..._collectFromBrowserconfig(
+                        bcResult.finalUrl || browserConfigCandidateUrl,
+                        bcResult.text
+                    )
+                );
+                break;
+            }
+        }
     }
 
     // Step 4: common paths
-    allCandidates.push(..._collectCommonPaths(origin));
+    originsToTry.forEach(targetOrigin => {
+        allCandidates.push(..._collectCommonPaths(targetOrigin));
+    });
 
     // Step 5: third-party fallbacks
-    allCandidates.push(..._collectThirdPartyFallbacks(hostname, origin));
+    hostnamesToTry.forEach(item => {
+        allCandidates.push(..._collectThirdPartyFallbacks(item.hostname, item.origin));
+    });
 
     // Step 6: deduplicate by URL (keep highest priority)
     const uniq = new Map();
@@ -5610,13 +5413,11 @@ function openSettingsModal() {
         els.toggleBgSettingsBtn.textContent = '设置背景';
     }
     pendingStorageMode = appSettings.storageMode || STORAGE_MODES.BROWSER;
-    remoteActionsEnabled = isRemoteMode(pendingStorageMode);
     populateSettingsForm();
     Array.from(els.storageModeRadios || []).forEach(radio => {
         radio.checked = radio.value === appSettings.storageMode;
     });
     updateStorageInfoVisibility(pendingStorageMode);
-    showRemoteActionsSection(remoteActionsEnabled && isRemoteMode(pendingStorageMode));
     if (els.settingsModal) {
         animateModalVisibility(els.settingsModal, { open: true });
     }
@@ -5627,30 +5428,50 @@ function closeSettingsModal() {
 }
 
 async function handleStorageModeChange(mode) {
-    pendingStorageMode = mode;
-    remoteActionsEnabled = false;
-    updateStorageInfoVisibility(mode);
-    showRemoteActionsSection(false);
+    pendingStorageMode = LOCAL_ONLY_MODE ? STORAGE_MODES.BROWSER : mode;
+    updateStorageInfoVisibility(pendingStorageMode);
 }
 
-async function switchStorageMode(targetMode) {
-    const snapshot = attachBackgroundToData(deepClone(appData));
-    
-    // 清空背景缓存和运行时状态，避免切换模式后出现闪烁
-    clearCloudBackgroundRuntime();
-    await clearAllCachedBackgrounds();
-    
-    appSettings.storageMode = targetMode;
-    saveSettings();
-    await persistAppData(snapshot, { mode: targetMode, notifyOnError: true });
-    await loadData({ mode: targetMode, notifyOnError: true });
-    renderApp();
-    // 图标缓存已在编辑时按需获取，无需批量预热
+function toAbsoluteExportUrl(value) {
+    if (!value || typeof value !== 'string') return value;
+    return normalizePersistedAssetUrl(value);
+}
+
+function buildExportDataSnapshot() {
+    const snapshot = deepClone(appData);
+    attachBackgroundToData(snapshot);
+    if (!snapshot || !Array.isArray(snapshot.categories)) {
+        return snapshot;
+    }
+
+    snapshot.categories.forEach(cat => {
+        walkCategoryBookmarks(cat, (bm) => {
+            if (!bm || typeof bm !== 'object') return;
+            if (typeof bm.icon === 'string' && bm.icon) {
+                bm.icon = toAbsoluteExportUrl(resolveCachedIconSrc(bm.icon));
+            }
+            if (Array.isArray(bm.iconFallbacks)) {
+                bm.iconFallbacks = bm.iconFallbacks
+                    .map(item => (typeof item === 'string' ? toAbsoluteExportUrl(resolveCachedIconSrc(item)) : item))
+                    .filter(Boolean);
+            }
+        });
+    });
+
+    if (snapshot.background && typeof snapshot.background === 'object') {
+        const bg = normalizeBackgroundSettings(snapshot.background);
+        if (bg.image) {
+            bg.image = toAbsoluteExportUrl(resolveCachedIconSrc(bg.image));
+        }
+        snapshot.background = bg;
+    }
+
+    return snapshot;
 }
 
 function exportDataAsFile() {
-    attachBackgroundToData(appData);
-    const dataStr = JSON.stringify(appData, null, 2);
+    const exportData = buildExportDataSnapshot();
+    const dataStr = JSON.stringify(exportData, null, 2);
     const blob = new Blob([dataStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -6083,8 +5904,12 @@ function normalizeNativeBookmark(bm) {
         title: bm.title || bm.name || url,
         url,
         iconType,
-        icon: bm.icon || (iconType === 'favicon' ? meta.icon : ''),
-        iconFallbacks: Array.isArray(bm.iconFallbacks) ? bm.iconFallbacks : []
+        icon: normalizePersistedAssetUrl(bm.icon || (iconType === 'favicon' ? meta.icon : '')),
+        iconFallbacks: Array.isArray(bm.iconFallbacks)
+            ? bm.iconFallbacks
+                .map(item => (typeof item === 'string' ? normalizePersistedAssetUrl(item) : ''))
+                .filter(Boolean)
+            : []
     };
 
     if (bookmark.iconType === 'favicon') {
@@ -6387,490 +6212,14 @@ function inferMimeFromDataUrl(dataUrl = '') {
     return match ? match[1] : '';
 }
 
-function deriveBackgroundFileName(uploadName, mimeType, fallbackBase = DEFAULT_BACKGROUND.cloud.fileName) {
-    const safeName = (uploadName || '').split(/[/\\]/).pop() || '';
-    const baseFromName = safeName.replace(/\.[^.]+$/, '') || fallbackBase;
-    const extFromName = (safeName.match(/\.([^.]+)$/) || [])[1] || '';
-    const extFromMime = inferExtFromMime(mimeType || '');
-    const ext = (extFromName || extFromMime || '').toLowerCase();
-    if (!ext) return baseFromName;
-    const cleanBase = baseFromName.replace(/\.[^.]+$/, '') || fallbackBase;
-    return `${cleanBase}.${ext}`;
-}
-
-function buildBackgroundCandidates(preferredName = '') {
-    const trimmed = (preferredName || '').trim() || DEFAULT_BACKGROUND.cloud.fileName;
-    const base = trimmed.replace(/\.[^.]+$/, '');
-    const extFromName = (trimmed.match(/\.([^.]+)$/) || [])[1];
-    const candidates = [];
-    if (extFromName) {
-        candidates.push(`${base}.${extFromName}`);
-    } else {
-        candidates.push(base);
-    }
-    const extensionVariants = new Set();
-    BACKGROUND_EXTENSIONS.forEach(ext => {
-        extensionVariants.add(ext);
-        extensionVariants.add(ext.toUpperCase());
-    });
-    // 兼容用户误写的 jepg/JEPG
-    extensionVariants.add('jepg');
-    extensionVariants.add('JEPG');
-    extensionVariants.forEach(ext => {
-        candidates.push(`${base}.${ext}`);
-    });
-    return Array.from(new Set(candidates));
-}
-
-function appendCacheBust(url = '', ts = Date.now()) {
-    if (!url) return '';
-    const separator = url.includes('?') ? '&' : '?';
-    const token = encodeURIComponent(ts);
-    return `${url}${separator}_=${token}`;
-}
-
-function stripCacheBust(url = '') {
-    if (!url) return '';
-    try {
-        const u = new URL(url);
-        u.searchParams.delete('_');
-        return u.toString();
-    } catch (error) {
-        const cleaned = url.replace(/([?&])_=[^&]*(&|$)/, (match, sep, tail) => {
-            if (sep === '?' && tail) return '?';
-            return sep;
-        }).replace(/[?&]$/, '');
-        return cleaned;
-    }
-}
-
-function getBackgroundVersionToken(cloud = {}) {
-    if (!cloud) return '';
-    const parts = [];
-    if (cloud.etag) parts.push(cloud.etag);
-    if (cloud.lastModified) parts.push(cloud.lastModified);
-    if (Number.isFinite(cloud.updatedAt) && cloud.updatedAt > 0) parts.push(cloud.updatedAt);
-    if (!parts.length) return '';
-    return parts.join('|');
-}
-
-function buildBackgroundDisplayUrl(background) {
-    if (!background) return '';
-    if (background.mode !== 'cloud') {
-        return background.image || '';
-    }
-    const base = background.cloud?.downloadUrl || '';
-    if (!base) return '';
-    const version = getBackgroundVersionToken(background.cloud);
-    return version ? appendCacheBust(base, version) : base;
-}
-
-function clearCloudBackgroundRuntime() {
-    if (cloudBackgroundRuntime.isObjectUrl && cloudBackgroundRuntime.url) {
-        try {
-            URL.revokeObjectURL(cloudBackgroundRuntime.url);
-        } catch (e) {
-            // 忽略撤销失败的错误
-        }
-    }
-    cloudBackgroundRuntime = {
-        url: '',
-        version: '',
-        isObjectUrl: false
-    };
-}
-
-function updateCloudBackgroundRuntime(url, version, isObjectUrl = false) {
-    const sameAsCurrent = cloudBackgroundRuntime.url === url
-        && cloudBackgroundRuntime.version === version
-        && cloudBackgroundRuntime.isObjectUrl === !!isObjectUrl;
-    if (sameAsCurrent) return;
-    if (cloudBackgroundRuntime.isObjectUrl && cloudBackgroundRuntime.url && cloudBackgroundRuntime.url !== url) {
-        URL.revokeObjectURL(cloudBackgroundRuntime.url);
-    }
-    cloudBackgroundRuntime = {
-        url: url || '',
-        version: version || '',
-        isObjectUrl: !!isObjectUrl
-    };
-}
-
-// --- IndexedDB Cache for Background Images ---
-const DB_NAME = 'MyLocalNewTabDB';
-const DB_VERSION = 1;
-const BG_STORE_NAME = 'backgrounds';
-
-function openBackgroundDB() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve(request.result);
-        request.onupgradeneeded = (event) => {
-            const db = event.target.result;
-            if (!db.objectStoreNames.contains(BG_STORE_NAME)) {
-                db.createObjectStore(BG_STORE_NAME, { keyPath: 'url' });
-            }
-        };
-    });
-}
-
-async function getCachedBackground(url) {
-    let db = null;
-    try {
-        db = await openBackgroundDB();
-        return new Promise((resolve, reject) => {
-            const transaction = db.transaction([BG_STORE_NAME], 'readonly');
-            const store = transaction.objectStore(BG_STORE_NAME);
-            const request = store.get(url);
-            request.onsuccess = () => {
-                resolve(request.result);
-            };
-            request.onerror = () => reject(request.error);
-            transaction.oncomplete = () => {
-                if (db) db.close();
-            };
-        });
-    } catch (e) {
-        if (db) db.close();
-        return null;
-    }
-}
-
-async function setCachedBackground(data) {
-    let db = null;
-    try {
-        db = await openBackgroundDB();
-        return new Promise((resolve, reject) => {
-            const transaction = db.transaction([BG_STORE_NAME], 'readwrite');
-            const store = transaction.objectStore(BG_STORE_NAME);
-            const request = store.put(data);
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
-            transaction.oncomplete = () => {
-                if (db) db.close();
-            };
-        });
-    } catch (e) {
-        if (db) db.close();
-        console.warn('IndexedDB write error', e);
-    }
-}
-
-// 清空 IndexedDB 中的所有背景缓存
-async function clearAllCachedBackgrounds() {
-    let db = null;
-    try {
-        db = await openBackgroundDB();
-        return new Promise((resolve, reject) => {
-            const transaction = db.transaction([BG_STORE_NAME], 'readwrite');
-            const store = transaction.objectStore(BG_STORE_NAME);
-            const request = store.clear();
-            request.onsuccess = () => {
-                console.log('Background cache cleared');
-                resolve();
-            };
-            request.onerror = () => reject(request.error);
-            transaction.oncomplete = () => {
-                if (db) db.close();
-            };
-        });
-    } catch (e) {
-        if (db) db.close();
-        console.warn('Failed to clear background cache', e);
-    }
-}
-
-async function checkAndRefreshBackgroundCache(displayUrl, storageMode, normalized, cachedData) {
-    try {
-        const cacheHeaders = {};
-        if (cachedData.etag) cacheHeaders['If-None-Match'] = cachedData.etag;
-        if (cachedData.lastModified) cacheHeaders['If-Modified-Since'] = cachedData.lastModified;
-
-        let resp;
-        if (storageMode === STORAGE_MODES.WEBDAV) {
-            const cfg = normalizeWebdavConfig(appSettings.webdav);
-            if (!cfg.username && !cfg.password) return;
-            resp = await fetchWithTimeout(displayUrl, {
-                method: 'GET',
-                headers: { ...buildWebdavHeaders(cfg, ''), ...cacheHeaders },
-                credentials: 'omit',
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-        } else if (storageMode === STORAGE_MODES.GIST) {
-            const cfg = normalizeGistConfig(appSettings.gist);
-            resp = await fetchWithTimeout(displayUrl, {
-                method: 'GET',
-                headers: { ...buildGistHeaders(cfg.token), ...cacheHeaders },
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-        }
-
-        if (resp && resp.ok) {
-            let blob;
-            const contentType = (resp.headers.get('content-type') || '').toLowerCase();
-            if (storageMode === STORAGE_MODES.GIST && !contentType.startsWith('image/')) {
-                 if (contentType.includes('json') || contentType.includes('text')) {
-                     return;
-                 }
-            }
-            blob = await resp.blob();
-            
-            if (blob) {
-                await setCachedBackground({
-                    url: displayUrl,
-                    blob: blob,
-                    etag: resp.headers.get('etag'),
-                    lastModified: resp.headers.get('last-modified'),
-                    timestamp: Date.now()
-                });
-                console.log('Background image cache updated from cloud.');
-            }
-        }
-    } catch (e) {
-        console.warn('Background cache refresh failed', e);
-    }
-}
-
-async function resolveBackgroundImageUrl(background, options = {}) {
-    const { allowBlocking = false } = options; // 是否允许阻塞等待远程下载
-    const normalized = normalizeBackgroundSettings(background);
-    const displayUrl = buildBackgroundDisplayUrl(normalized);
-
-    // 非云端模式：直接使用本地/链接，清空云端缓存
-    if (normalized.mode !== 'cloud') {
-        clearCloudBackgroundRuntime();
-        const url = normalized.image && normalized.image.startsWith('sync:')
-            ? normalized.image.substring(5)
-            : displayUrl;
-        return { url, isObjectUrl: false, version: '' };
-    }
-
-    // 云端模式但无可用链接
-    if (!displayUrl) {
-        clearCloudBackgroundRuntime();
-        return { url: '', isObjectUrl: false, version: '' };
-    }
-
-    const versionToken = getBackgroundVersionToken(normalized.cloud) || (normalized.cloud?.downloadUrl || '');
-    if (cloudBackgroundRuntime.url && cloudBackgroundRuntime.version === versionToken) {
-        return { ...cloudBackgroundRuntime };
-    }
-
-    const storageMode = getEffectiveStorageMode();
-    const cacheHeaders = buildBackgroundConditionalHeaders(normalized.cloud);
-    let resolvedUrl = '';
-    let isObjectUrl = false;
-
-    // 尝试从 IndexedDB 读取缓存
-    if (isRemoteMode(storageMode)) {
-        const cachedData = await getCachedBackground(displayUrl);
-        if (cachedData && cachedData.blob) {
-            resolvedUrl = URL.createObjectURL(cachedData.blob);
-            isObjectUrl = true;
-            updateCloudBackgroundRuntime(resolvedUrl, versionToken, isObjectUrl);
-            // 后台检查更新（不阻塞）
-            checkAndRefreshBackgroundCache(displayUrl, storageMode, normalized, cachedData);
-            return { url: resolvedUrl, isObjectUrl, version: versionToken };
-        }
-    }
-
-    // 没有缓存时的处理
-    if (!allowBlocking) {
-        // 初始加载时不阻塞，直接返回空，让后台刷新
-        // 触发后台下载
-        downloadAndCacheBackgroundInBackground(displayUrl, storageMode, normalized, versionToken);
-        return { url: '', isObjectUrl: false, version: '' };
-    }
-
-    // 允许阻塞时（如用户手动刷新），执行下载
-    const result = await downloadBackgroundFromRemote(displayUrl, storageMode, cacheHeaders, versionToken);
-    return result;
-}
-
-// 后台下载并缓存背景图，完成后自动应用
-async function downloadAndCacheBackgroundInBackground(displayUrl, storageMode, normalized, versionToken) {
-    try {
-        const cacheHeaders = buildBackgroundConditionalHeaders(normalized.cloud);
-        const result = await downloadBackgroundFromRemote(displayUrl, storageMode, cacheHeaders, versionToken);
-        if (result.url) {
-            // 下载完成，直接应用背景（此时 cloudBackgroundRuntime 已更新，不会再次下载）
-            applyBackgroundDirectly(result.url, normalized.opacity);
-        }
-    } catch (error) {
-        // 网络错误是预期的，静默处理
-        if (!isNetworkError(error)) {
-            console.warn('后台下载背景图失败', error);
-        }
-    }
-}
-
-// 直接应用背景图 URL，不触发远程下载
-function applyBackgroundDirectly(imageUrl, opacity) {
-    const root = document.documentElement;
-    if (!imageUrl) return;
-    
-    if (root) {
-        root.style.setProperty('--custom-bg-opacity', opacity);
-    }
-    
-    // 预加载图片
-    const img = new Image();
-    img.onload = () => {
-        if (root) root.style.setProperty('--custom-bg-image', `url(${imageUrl})`);
-        if (document.body) document.body.classList.add('custom-bg-enabled');
-    };
-    img.onerror = () => {
-        console.warn('背景图加载失败');
-    };
-    img.src = imageUrl;
-}
-
-// 从远程下载背景图
-async function downloadBackgroundFromRemote(displayUrl, storageMode, cacheHeaders, versionToken) {
-    let resolvedUrl = '';
-    let isObjectUrl = false;
-
-    try {
-        if (storageMode === STORAGE_MODES.WEBDAV) {
-            const cfg = normalizeWebdavConfig(appSettings.webdav);
-            // 防止配置不完整导致浏览器原生弹窗
-            if (!cfg.username && !cfg.password) {
-                return { url: '', isObjectUrl: false, version: '' };
-            }
-            const resp = await fetchWithTimeout(displayUrl, {
-                method: 'GET',
-                headers: { ...buildWebdavHeaders(cfg, ''), ...cacheHeaders },
-                credentials: 'omit',
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-            if (resp.status === 304 && cloudBackgroundRuntime.url) {
-                return { ...cloudBackgroundRuntime };
-            }
-            if (resp.ok) {
-                const blob = await resp.blob();
-                resolvedUrl = URL.createObjectURL(blob);
-                isObjectUrl = true;
-                // 保存到缓存
-                setCachedBackground({
-                    url: displayUrl,
-                    blob: blob,
-                    etag: resp.headers.get('etag'),
-                    lastModified: resp.headers.get('last-modified'),
-                    timestamp: Date.now()
-                });
-            }
-        } else if (storageMode === STORAGE_MODES.GIST) {
-            const cfg = normalizeGistConfig(appSettings.gist);
-            const resp = await fetchWithTimeout(displayUrl, {
-                method: 'GET',
-                headers: { ...buildGistHeaders(cfg.token), ...cacheHeaders },
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-            if (resp.status === 304 && cloudBackgroundRuntime.url) {
-                return { ...cloudBackgroundRuntime };
-            }
-            if (resp.ok) {
-                const contentType = (resp.headers.get('content-type') || '').toLowerCase();
-                if (contentType.startsWith('image/')) {
-                    const blob = await resp.blob();
-                    resolvedUrl = URL.createObjectURL(blob);
-                    isObjectUrl = true;
-                    // 保存到缓存
-                    setCachedBackground({
-                        url: displayUrl,
-                        blob: blob,
-                        etag: resp.headers.get('etag'),
-                        lastModified: resp.headers.get('last-modified'),
-                        timestamp: Date.now()
-                    });
-                } else {
-                    // Gist 返回的是文本（Base64 DataURL）
-                    const text = await resp.text();
-                    const trimmed = text.trim();
-                    if (trimmed.startsWith('data:image')) {
-                        // 将 Base64 DataURL 转换为 Blob URL 以避免 CSS url() 长度限制
-                        const blob = dataUrlToBlob(trimmed);
-                        if (blob) {
-                            resolvedUrl = URL.createObjectURL(blob);
-                            isObjectUrl = true;
-                            // 保存 Blob 到缓存，后续加载无需重复下载和解码
-                            setCachedBackground({
-                                url: displayUrl,
-                                blob: blob,
-                                etag: resp.headers.get('etag'),
-                                lastModified: resp.headers.get('last-modified'),
-                                timestamp: Date.now()
-                            });
-                        } else {
-                            // Blob 转换失败，降级使用 DataURL（小图片可能可用）
-                            resolvedUrl = trimmed;
-                        }
-                    }
-                }
-            }
-        }
-    } catch (error) {
-        // 网络错误静默处理，不影响用户体验
-        if (!isNetworkError(error)) {
-            console.warn('读取云端背景失败', error);
-        }
-    }
-
-    if (!resolvedUrl) {
-        // 若当前有缓存并且版本未变，则继续沿用缓存，避免闪烁
-        if (cloudBackgroundRuntime.url && cloudBackgroundRuntime.version === versionToken) {
-            return { ...cloudBackgroundRuntime };
-        }
-        return { url: '', isObjectUrl: false, version: '' };
-    }
-
-    updateCloudBackgroundRuntime(resolvedUrl, versionToken, isObjectUrl);
-    return { url: resolvedUrl, isObjectUrl, version: versionToken };
-}
-
-function parseHttpDateToTs(value = '') {
-    const ts = Date.parse(value);
-    return Number.isFinite(ts) ? ts : 0;
-}
-
-function buildBackgroundConditionalHeaders(cloud = {}) {
-    const headers = {};
-    if (cloud.etag) {
-        headers['If-None-Match'] = cloud.etag;
-    }
-    if (cloud.lastModified) {
-        headers['If-Modified-Since'] = cloud.lastModified;
-    }
-    return headers;
-}
-
-function buildBackgroundRemoteName(uploadName, mimeType) {
-    const extFromName = (uploadName || '').match(/\.([^.]+)$/);
-    const extFromMime = inferExtFromMime(mimeType || '');
-    const ext = (extFromName && extFromName[1]) || extFromMime || 'jpg';
-    const cleanExt = BACKGROUND_EXTENSIONS.includes(ext.toLowerCase()) ? ext.toLowerCase() : (inferExtFromMime(`image/${ext}`) || 'jpg');
-    return `background.${cleanExt}`;
-}
-
-async function applyBackgroundFromSettings(options = {}) {
-    const { allowBlocking = false } = options;
+async function applyBackgroundFromSettings() {
     const normalizedBg = normalizeBackgroundSettings(appSettings.background);
     appSettings.background = normalizedBg;
-    const opacity = normalizedBg.opacity;
-    const { url: actualImageUrl } = await resolveBackgroundImageUrl(normalizedBg, { allowBlocking });
-    const hasImage = !!actualImageUrl;
-    
+    const rawImageUrl = normalizedBg.image || '';
+    const imageUrl = resolveAssetDisplayUrl(rawImageUrl);
     const root = document.documentElement;
-    
-    // 如果没有图片且不阻塞模式，保持现有背景不变（等待后台加载）
-    if (!hasImage && !allowBlocking && normalizedBg.mode === 'cloud') {
-        // 云端模式下没有缓存，后台会下载并自动应用，这里先不清除已有背景
-        return;
-    }
-    
-    // 如果没有图片，直接清除并返回
-    if (!hasImage) {
-        clearCloudBackgroundRuntime();
+
+    if (!imageUrl) {
         if (root) {
             root.style.setProperty('--custom-bg-image', 'none');
             root.style.setProperty('--custom-bg-opacity', 0);
@@ -6881,41 +6230,28 @@ async function applyBackgroundFromSettings(options = {}) {
         return;
     }
 
-    // 有图片，先设置透明度变量（此时 body 还没 class，所以不会显示）
     if (root) {
-        root.style.setProperty('--custom-bg-opacity', opacity);
+        root.style.setProperty('--custom-bg-opacity', normalizedBg.opacity);
     }
 
-    // 预加载图片
     return new Promise((resolve) => {
         const img = new Image();
-        let resolved = false;
-        
-        const finish = (success) => {
-            if (resolved) return;
-            resolved = true;
-            if (success) {
-                if (root) root.style.setProperty('--custom-bg-image', `url(${actualImageUrl})`);
+        let done = false;
+        const finish = (ok) => {
+            if (done) return;
+            done = true;
+            if (ok) {
+                if (root) root.style.setProperty('--custom-bg-image', `url(${imageUrl})`);
                 if (document.body) document.body.classList.add('custom-bg-enabled');
-            } else {
-                // 失败时不显示背景
-                clearCloudBackgroundRuntime();
-                if (document.body) document.body.classList.remove('custom-bg-enabled');
+            } else if (document.body) {
+                document.body.classList.remove('custom-bg-enabled');
             }
             resolve();
         };
-
         img.onload = () => finish(true);
-        img.onerror = () => {
-            console.warn('背景图加载失败');
-            finish(false);
-        };
-        
-        // 设置超时，避免过久阻塞（例如 1.5 秒）
-        // 注意：如果是 Base64，onload 通常很快；如果是网络图片，超时能防止白屏太久
+        img.onerror = () => finish(false);
         setTimeout(() => finish(true), 1500);
-        
-        img.src = actualImageUrl;
+        img.src = imageUrl;
     });
 }
 
@@ -6939,15 +6275,7 @@ function maybeSyncBackgroundFromData(data, { saveSettingsFlag = false } = {}) {
     const bg = extractBackgroundFromData(data);
     if (!bg) return false;
     const current = normalizeBackgroundSettings(appSettings.background);
-    const merged = normalizeBackgroundSettings({
-        ...current,
-        ...bg,
-        image: bg.image || current.image,
-        cloud: {
-            ...current.cloud,
-            ...(bg.cloud || {})
-        }
-    });
+    const merged = normalizeBackgroundSettings({ ...current, ...bg });
     appSettings.background = merged;
     applyBackgroundFromSettings({ allowBlocking: true });
     if (saveSettingsFlag) {
@@ -6970,10 +6298,7 @@ function maybeSyncUiOpacityFromData(data, { saveSettingsFlag = false } = {}) {
 function attachBackgroundToData(data) {
     if (!data || typeof data !== 'object') return data;
     const normalized = normalizeBackgroundSettings(appSettings.background);
-    const isDataUrl = typeof normalized.image === 'string' && normalized.image.startsWith('data:');
-    const shouldStripImage = normalized.mode === 'cloud' || (isRemoteMode(appSettings.storageMode) && isDataUrl);
-    const backgroundForData = shouldStripImage ? { ...normalized, image: '' } : normalized;
-    data.background = backgroundForData;
+    data.background = normalized;
     data.uiOpacity = getUiOpacity();
     return data;
 }
@@ -6983,573 +6308,82 @@ function persistBackgroundChange() {
     saveData({ notifyOnError: true });
 }
 
-function getWebdavBaseUrl(endpoint = '') {
-    if (!endpoint) return '';
-    try {
-        const urlObj = new URL(endpoint);
-        const segments = urlObj.pathname.split('/');
-        segments.pop();
-        urlObj.pathname = segments.join('/') + (segments.length ? '/' : '');
-        urlObj.search = '';
-        urlObj.hash = '';
-        return urlObj.toString();
-    } catch (error) {
-        const lastSlash = endpoint.lastIndexOf('/');
-        if (lastSlash === -1) return '';
-        return endpoint.slice(0, lastSlash + 1);
-    }
-}
-
-function buildWebdavBackgroundUrl(fileName) {
-    const cfg = normalizeWebdavConfig(appSettings.webdav);
-    const base = getWebdavBaseUrl(cfg.endpoint);
-    if (!base) return '';
-    const encoded = encodeURIComponent(fileName || DEFAULT_BACKGROUND.cloud.fileName);
-    return base.endsWith('/') ? `${base}${encoded}` : `${base}/${encoded}`;
-}
-
-async function fetchWebdavBackgroundFile(preferredName, { metadataOnly = false, cacheHeaders = {} } = {}) {
-    const cfg = normalizeWebdavConfig(appSettings.webdav);
-    if (!cfg.endpoint) return null;
-    // 防止配置不完整导致浏览器原生弹窗
-    if (!cfg.username && !cfg.password) {
-        return null;
-    }
-    const base = getWebdavBaseUrl(cfg.endpoint);
-    if (!base) return null;
-    const candidates = buildBackgroundCandidates(preferredName);
-    for (const name of candidates) {
-        const remoteUrl = base.endsWith('/') ? `${base}${encodeURIComponent(name)}` : `${base}/${encodeURIComponent(name)}`;
-        try {
-            const headers = { ...buildWebdavHeaders(cfg, ''), ...cacheHeaders };
-            const resp = await fetchWithTimeout(remoteUrl, {
-                method: metadataOnly ? 'HEAD' : 'GET',
-                headers,
-                credentials: 'omit',
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-            if (resp.status === 304) {
-                return {
-                    dataUrl: '',
-                    fileName: name,
-                    remoteUrl,
-                    notModified: true
-                };
-            }
-            if (!resp.ok) {
-                // 部分 WebDAV 端可能不支持 HEAD，退回到 Range 请求以获取元数据
-                if (metadataOnly && (resp.status === 405 || resp.status === 501)) {
-                    const rangeResp = await fetchWithTimeout(remoteUrl, {
-                        method: 'GET',
-                        headers: { ...headers, Range: 'bytes=0-0' },
-                        credentials: 'omit',
-                        cache: 'no-store'
-                    }, REMOTE_FETCH_TIMEOUT);
-                    if (!rangeResp.ok) continue;
-                    const lastModified = rangeResp.headers.get('last-modified') || '';
-                    const etag = rangeResp.headers.get('etag') || '';
-                    return {
-                        dataUrl: '',
-                        fileName: name,
-                        remoteUrl,
-                        etag,
-                        lastModified,
-                        updatedAt: parseHttpDateToTs(lastModified)
-                    };
-                }
-                continue;
-            }
-            const lastModified = resp.headers.get('last-modified') || '';
-            const etag = resp.headers.get('etag') || '';
-            return {
-                dataUrl: '',
-                fileName: name,
-                remoteUrl,
-                etag,
-                lastModified,
-                updatedAt: parseHttpDateToTs(lastModified)
-            };
-        } catch (error) {
-            console.warn('读取 WebDAV 背景失败', error);
-        }
-    }
-    return null;
-}
-
-async function uploadWebdavBackground(imageDataUrl, uploadName, mimeType) {
-    const cfg = normalizeWebdavConfig(appSettings.webdav);
-    if (!cfg.endpoint) {
-        throw new Error('未填写 WebDAV 文件地址');
-    }
-    const fileName = uploadName || buildBackgroundRemoteName('', mimeType);
-    const remoteUrl = buildWebdavBackgroundUrl(fileName);
-    if (!remoteUrl) {
-        throw new Error('WebDAV 地址格式不正确');
-    }
-    const blob = dataUrlToBlob(imageDataUrl);
-    if (!blob) {
-        throw new Error('无法读取图片数据');
-    }
-    const response = await fetchWithTimeout(remoteUrl, {
-        method: 'PUT',
-        headers: buildWebdavHeaders(cfg, blob.type || 'application/octet-stream'),
-        credentials: 'omit',
-        body: blob
-    }, REMOTE_FETCH_TIMEOUT);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-    return { fileName, remoteUrl };
-}
-
-async function fetchGistBackgroundFile(preferredName) {
-    const cfg = normalizeGistConfig(appSettings.gist);
-    if (!cfg.token || !cfg.gistId) return null;
-    const response = await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-        method: 'GET',
-        headers: buildGistHeaders(cfg.token),
-        cache: 'no-store'
-    }, REMOTE_FETCH_TIMEOUT);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-    const gist = await response.json();
-    const files = gist?.files || {};
-    const candidates = buildBackgroundCandidates(preferredName);
-    const targetKey = candidates.find(name => files[name]);
-    if (!targetKey) return null;
-    const fileMeta = files[targetKey];
-    if (!fileMeta?.raw_url) return null;
-
-    // 直接使用 raw_url，避免将大图转为 base64 占用存储
-    return {
-        dataUrl: '',
-        fileName: targetKey,
-        remoteUrl: fileMeta.raw_url,
-        etag: (gist?.history && gist.history[0]?.version) || '',
-        lastModified: fileMeta.updated_at || gist?.updated_at || '',
-        updatedAt: parseHttpDateToTs(fileMeta.updated_at || gist?.updated_at)
-    };
-}
-
-async function uploadGistBackground(imageDataUrl, uploadName, mimeType) {
-    const cfg = normalizeGistConfig(appSettings.gist);
-    if (!cfg.token) {
-        throw new Error('未填写 Gist Token');
-    }
-    if (!cfg.gistId) {
-        throw new Error('未填写 Gist ID');
-    }
-    
-    // 性能提示：Gist将Base64作为文本存储，大图片会导致：
-    // 1. 体积增加约33%（Base64编码开销）
-    // 2. 同步速度慢（需传输整个文本）
-    // 3. 加载解码慢（浏览器需解析Base64字符串）
-    // 建议：图片<5MB，或使用图床+URL模式
-    const sizeMB = (imageDataUrl.length / 1024 / 1024).toFixed(2);
-    if (imageDataUrl.length > 5 * 1024 * 1024) {
-        console.warn(`⚠️ Gist背景图片较大(${sizeMB}MB)，可能导致同步缓慢。建议使用图床服务。`);
-    }
-    
-    const fileName = uploadName || buildBackgroundRemoteName('', mimeType);
-    const response = await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-        method: 'PATCH',
-        headers: buildGistHeaders(cfg.token),
-        body: JSON.stringify({
-            files: {
-                [fileName]: { content: imageDataUrl }
-            }
-        })
-    }, REMOTE_FETCH_TIMEOUT);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-    const gist = await response.json();
-    const remoteUrl = gist?.files?.[fileName]?.raw_url || '';
-    return { fileName, remoteUrl };
-}
-
-async function uploadCloudBackground(imageDataUrl, uploadName, mimeType) {
-    const storageMode = appSettings.storageMode || STORAGE_MODES.BROWSER;
-    if (storageMode === STORAGE_MODES.WEBDAV) {
-        return uploadWebdavBackground(imageDataUrl, uploadName, mimeType);
-    }
-    if (storageMode === STORAGE_MODES.GIST) {
-        return uploadGistBackground(imageDataUrl, uploadName, mimeType);
-    }
-    throw new Error('当前存储模式不支持云端背景');
-}
-
-async function cleanupOldCloudBackgroundFiles(newFileName, previousFileName, storageMode) {
-    const mode = storageMode || getEffectiveStorageMode();
-    if (!isRemoteMode(mode)) return;
-    const cleanNew = (newFileName || '').trim();
-
-    if (mode === STORAGE_MODES.WEBDAV) {
-        const cfg = normalizeWebdavConfig(appSettings.webdav);
-        const base = getWebdavBaseUrl(cfg.endpoint);
-        if (!cfg.endpoint || !base) return;
-        
-        // 删除所有可能的旧背景文件（所有格式变体）
-        const targets = buildBackgroundCandidates(cleanNew).filter(name => name && name !== cleanNew);
-        if (previousFileName && previousFileName !== cleanNew && !targets.includes(previousFileName)) {
-            targets.unshift(previousFileName);
-        }
-        
-        for (const name of targets) {
-            const remoteUrl = base.endsWith('/') ? `${base}${encodeURIComponent(name)}` : `${base}/${encodeURIComponent(name)}`;
-            try {
-                await fetchWithTimeout(remoteUrl, {
-                    method: 'DELETE',
-                    headers: buildWebdavHeaders(cfg, ''),
-                    credentials: 'omit',
-                    cache: 'no-store'
-                }, REMOTE_FETCH_TIMEOUT);
-            } catch (error) {
-                console.warn('清理旧 WebDAV 背景失败', name, error);
-            }
-        }
-        return;
-    }
-    
-    if (mode === STORAGE_MODES.GIST) {
-        const cfg = normalizeGistConfig(appSettings.gist);
-        if (!cfg.token || !cfg.gistId) return;
-        
-        try {
-            // 先获取 Gist 的所有文件列表
-            const response = await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-                method: 'GET',
-                headers: buildGistHeaders(cfg.token),
-                cache: 'no-store'
-            }, REMOTE_FETCH_TIMEOUT);
-            
-            if (!response.ok) {
-                console.warn('获取 Gist 文件列表失败', response.status);
-                return;
-            }
-            
-            const gist = await response.json();
-            const existingFiles = gist?.files || {};
-            
-            // 找出所有需要删除的背景图文件
-            const filesToDelete = {};
-            Object.keys(existingFiles).forEach(fileName => {
-                // 匹配 background.* 格式的文件，但排除新上传的文件
-                if (fileName.startsWith('background.') && fileName !== cleanNew) {
-                    filesToDelete[fileName] = null; // null 表示删除
-                }
-            });
-            
-            // 如果有旧文件需要删除，执行删除操作
-            if (Object.keys(filesToDelete).length > 0) {
-                await fetchWithTimeout(`https://api.github.com/gists/${cfg.gistId}`, {
-                    method: 'PATCH',
-                    headers: buildGistHeaders(cfg.token),
-                    body: JSON.stringify({ files: filesToDelete })
-                }, REMOTE_FETCH_TIMEOUT);
-                console.log('已清理旧 Gist 背景文件:', Object.keys(filesToDelete));
-            }
-        } catch (error) {
-            console.warn('清理旧 Gist 背景失败', error);
-        }
-    }
-}
-
-async function refreshCloudBackgroundFromRemote({ notifyWhenMissing = false } = {}) {
-    const background = normalizeBackgroundSettings(appSettings.background);
-    if (background.mode !== 'cloud') return false;
-    const storageMode = getEffectiveStorageMode();
-    if (!isRemoteMode(storageMode)) {
-        if (notifyWhenMissing) {
-            alert('云端背景需要先配置 WebDAV 或 Gist。');
-        }
-        return false;
-    }
-    try {
-        const cacheHeaders = buildBackgroundConditionalHeaders(background.cloud);
-        let result = null;
-        if (storageMode === STORAGE_MODES.WEBDAV) {
-            result = await fetchWebdavBackgroundFile(background.cloud.fileName, { metadataOnly: true, cacheHeaders });
-        } else if (storageMode === STORAGE_MODES.GIST) {
-            result = await fetchGistBackgroundFile(background.cloud.fileName);
-        }
-        if (!result) {
-            if (notifyWhenMissing) {
-                alert('未在云端找到 background 图片，请上传。');
-            }
-            return false;
-        }
-
-        const prevCloud = background.cloud || {};
-        const prevUrl = stripCacheBust(prevCloud.downloadUrl || '');
-        const cleanRemoteUrl = stripCacheBust(result.remoteUrl || prevUrl);
-        const nextCloud = {
-            ...prevCloud,
-            fileName: result.fileName || prevCloud.fileName,
-            downloadUrl: cleanRemoteUrl || prevUrl,
-            etag: prevCloud.etag || '',
-            lastModified: prevCloud.lastModified || '',
-            updatedAt: Number.isFinite(prevCloud.updatedAt) ? prevCloud.updatedAt : 0
-        };
-
-        if (!result.notModified) {
-            if (result.etag) nextCloud.etag = result.etag;
-            if (result.lastModified) nextCloud.lastModified = result.lastModified;
-            const remoteTs = Number.isFinite(result.updatedAt) ? result.updatedAt : parseHttpDateToTs(result.lastModified);
-            if (Number.isFinite(remoteTs) && remoteTs > 0) {
-                nextCloud.updatedAt = remoteTs;
-            } else {
-                nextCloud.updatedAt = Date.now();
-            }
-        }
-
-        const urlChanged = prevUrl !== cleanRemoteUrl;
-        const prevToken = getBackgroundVersionToken(prevCloud);
-        const nextToken = getBackgroundVersionToken(nextCloud);
-        const fileChanged = (result.fileName || prevCloud.fileName || '') !== (prevCloud.fileName || '');
-        const shouldPersist = urlChanged || (!result.notModified && nextToken !== prevToken) || (!prevUrl && cleanRemoteUrl) || fileChanged;
-
-        if (shouldPersist) {
-            appSettings.background = normalizeBackgroundSettings({
-                ...background,
-                cloud: nextCloud,
-                image: '' // 云端模式只使用远端 URL，避免大图写入本地存储
-            });
-            saveSettings();
-            applyBackgroundFromSettings({ allowBlocking: true });
-        }
-        updateBackgroundControlsUI();
-        return true;
-    } catch (error) {
-        // 网络请求失败是预期情况，降级为 debug
-        if (isNetworkError(error)) {
-            console.debug('[背景] 网络不可用，跳过云端刷新');
-        } else {
-            console.warn('刷新云端背景失败', error);
-        }
-        if (notifyWhenMissing) {
-            alert(`云端背景读取失败：${error.message}`);
-        }
-        return false;
-    }
-}
-
-async function handleBackgroundSourceChange() {
-    const selected = Array.from(els.backgroundSourceRadios || []).find(r => r.checked);
-    const mode = selected ? selected.value : 'local';
-    const normalizedMode = mode === 'cloud' ? 'cloud' : 'local';
-    const prevMode = appSettings.background?.mode;
-    // 允许重复点击同一模式时重新执行逻辑，避免需要先切回本地再切回云端
-    if (normalizedMode === 'cloud' && !isRemoteBackgroundReady()) {
-        alert('云端背景需要先配置 WebDAV 或 Gist。');
-        Array.from(els.backgroundSourceRadios || []).forEach(radio => {
-            radio.checked = radio.value === 'local';
-        });
-        return;
-    }
-    let nextBg = normalizeBackgroundSettings({
-        ...appSettings.background,
-        mode: normalizedMode
-    });
-    if (normalizedMode === 'cloud') {
-        nextBg = normalizeBackgroundSettings({
-            ...nextBg,
-            image: '',
-            cloud: {
-                ...nextBg.cloud,
-                downloadUrl: '',
-                updatedAt: 0,
-                etag: '',
-                lastModified: ''
-            }
-        });
-    }
-    clearCloudBackgroundRuntime();
-    appSettings.background = nextBg;
-    saveSettings();
-    applyBackgroundFromSettings();
-    updateBackgroundControlsUI();
-    if (normalizedMode === 'cloud') {
-        refreshCloudBackgroundFromRemote({ notifyWhenMissing: true });
-    }
-    persistBackgroundChange();
-}
-
 function updateBackgroundControlsUI() {
     const uiOpacity = applyUiOpacity(appSettings.uiOpacity);
-    const uiOpacityPercent = Math.round(uiOpacity * 100);
     if (els.uiOpacity) {
-        els.uiOpacity.value = uiOpacityPercent;
+        els.uiOpacity.value = Math.round(uiOpacity * 100);
     }
     if (els.uiOpacityValue) {
-        els.uiOpacityValue.textContent = `${uiOpacityPercent}%`;
+        els.uiOpacityValue.textContent = `${Math.round(uiOpacity * 100)}%`;
     }
 
     const background = normalizeBackgroundSettings(appSettings.background);
-    const storageMode = getEffectiveStorageMode();
-    const remoteReady = isRemoteBackgroundReady();
     appSettings.background = background;
 
-    const isRemoteStorage = remoteReady;
-    const isCloudMode = background.mode === 'cloud';
-    const opacityPercent = Math.round(background.opacity * 100);
     if (els.backgroundOpacity) {
-        els.backgroundOpacity.value = opacityPercent;
+        els.backgroundOpacity.value = Math.round(background.opacity * 100);
     }
     if (els.backgroundOpacityValue) {
-        els.backgroundOpacityValue.textContent = `${opacityPercent}%`;
-    }
-
-    // 背景来源单选
-    if (els.backgroundSourceRadios) {
-        Array.from(els.backgroundSourceRadios).forEach(radio => {
-            radio.checked = radio.value === (isCloudMode ? 'cloud' : 'local');
-        });
+        els.backgroundOpacityValue.textContent = `${Math.round(background.opacity * 100)}%`;
     }
     if (els.bgSourceTip) {
-        if (isCloudMode) {
-            const modeName = storageMode === STORAGE_MODES.WEBDAV ? 'WebDAV' : (storageMode === STORAGE_MODES.GIST ? 'Gist' : '云端');
-            els.bgSourceTip.textContent = `云端同步：在 ${modeName} 的数据文件同目录查找/保存 background 图片，可在多设备共用。`;
-        } else {
-            els.bgSourceTip.textContent = '本地：仅保存在此设备的浏览器中，不会推送到云端数据文件。';
-        }
+        els.bgSourceTip.textContent = '本地：背景保存到本地数据库，可导出数据迁移。';
     }
-    
-    toggleSettingsSection(els.bgLocalSection, !isCloudMode);
-    toggleSettingsSection(els.bgCloudSection, isCloudMode);
-    
-    // 判断背景类型：base64, sync URL, 或 local URL
-    const displayUrl = buildBackgroundDisplayUrl(background);
-    const runtimeCloudUrl = isCloudMode ? (cloudBackgroundRuntime.url || '') : '';
-    let actualImageUrl = isCloudMode ? (runtimeCloudUrl || displayUrl) : displayUrl;
-    let isSyncUrl = false;
-    let isLocalUrl = false;
-    
-    if (!isCloudMode && background.image) {
-        if (background.image.startsWith('sync:')) {
-            isSyncUrl = true;
-            actualImageUrl = background.image.substring(5); // 移除 "sync:" 前缀
-        } else if (!background.image.startsWith('data:')) {
-            isLocalUrl = true;
-            actualImageUrl = background.image;
-        } else {
-            actualImageUrl = displayUrl;
-        }
-    }
-    
-    const isUrl = isSyncUrl || isLocalUrl;
-    const hasAnyImage = !!actualImageUrl;
-    
-    if (els.cloudBgStatus) {
-        const cloudFile = background.cloud.fileName || 'background';
-        if (!isRemoteStorage) {
-            els.cloudBgStatus.textContent = '云端背景需先配置 WebDAV 或 Gist。';
-        } else if (hasAnyImage) {
-            els.cloudBgStatus.textContent = `已加载云端背景（${cloudFile}），可点击“上传/修改”替换。`;
-        } else {
-            els.cloudBgStatus.textContent = `未在云端找到 ${cloudFile}.*，请上传或点击“刷新云端”。`;
-        }
-    }
-    if (els.cloudRefreshBtn) {
-        els.cloudRefreshBtn.disabled = !isCloudMode || !isRemoteStorage;
-    }
-    if (els.cloudUploadBtn) {
-        els.cloudUploadBtn.disabled = !isCloudMode || !isRemoteStorage;
-    }
-    
+
+    const actualImageUrl = normalizePersistedAssetUrl(background.image || '');
+    const sourceUrl = typeof background.source === 'string' ? background.source.trim() : '';
+    const displayUrl = sourceUrl || (
+        actualImageUrl && !isPersistedAssetReference(actualImageUrl) && !actualImageUrl.startsWith('data:')
+            ? actualImageUrl
+            : ''
+    );
+    const isUrl = !!displayUrl;
+
     if (els.backgroundUrlInput) {
-        if (isCloudMode) {
-            els.backgroundUrlInput.value = '';
-            els.backgroundUrlInput.disabled = true;
-            els.backgroundUrlInput.placeholder = '云端模式：请用“本地上传”选择图片并同步';
-        } else {
-            els.backgroundUrlInput.disabled = false;
-            els.backgroundUrlInput.placeholder = 'https://example.com/background.jpg';
-            els.backgroundUrlInput.value = isUrl ? actualImageUrl : '';
-        }
+        els.backgroundUrlInput.disabled = false;
+        els.backgroundUrlInput.placeholder = 'https://example.com/background.jpg';
+        els.backgroundUrlInput.value = isUrl ? displayUrl : '';
     }
-    
-    // 更新提示信息
+
     const urlModeTip = document.getElementById('urlModeTip');
     if (urlModeTip) {
-        if (isCloudMode) {
-            urlModeTip.textContent = '云端模式使用单独的 background 图片文件，同步前请上传图片。';
-        } else {
-            urlModeTip.textContent = '推荐 4K 用户使用图床链接（如 Imgur、SM.MS、GitHub），无大小限制。';
-        }
+        urlModeTip.textContent = '推荐使用稳定的图片链接；链接图片会自动下载并保存到本地数据库。';
     }
-    
-    // 更新状态标签
+
     if (els.bgStatusTag) {
-        if (isCloudMode) {
-            if (!isRemoteStorage) {
-                els.bgStatusTag.textContent = '⚠️ 云端未配置';
-                els.bgStatusTag.className = 'bg-tag';
-                els.bgStatusTag.title = '请先在下方配置 WebDAV 或 Gist 后再使用云端背景';
-            } else if (!hasAnyImage) {
-                els.bgStatusTag.textContent = '☁️ 等待上传';
-                els.bgStatusTag.className = 'bg-tag';
-                els.bgStatusTag.title = '未在云端找到 background 图片，请上传并同步';
-            } else {
-                const modeName = storageMode === STORAGE_MODES.WEBDAV ? 'WebDAV' : 'Gist';
-                els.bgStatusTag.textContent = `☁️ 云端背景（${modeName}）`;
-                els.bgStatusTag.className = 'bg-tag accent';
-                els.bgStatusTag.title = '已从云端读取 background 图片，可重新上传替换';
-            }
+        if (!actualImageUrl) {
+            els.bgStatusTag.textContent = '🖼️ 未设置背景';
+            els.bgStatusTag.className = 'bg-tag';
+        } else if (isPersistedAssetReference(actualImageUrl)) {
+            els.bgStatusTag.textContent = '📦 本地数据库';
+            els.bgStatusTag.className = 'bg-tag accent';
+        } else if (actualImageUrl.startsWith('data:')) {
+            els.bgStatusTag.textContent = '📦 本地数据';
+            els.bgStatusTag.className = 'bg-tag';
         } else {
-            const isRemote = isRemoteMode(storageMode);
-            if (!background.image) {
-                els.bgStatusTag.textContent = '🖼️ 未设置背景';
-                els.bgStatusTag.className = 'bg-tag';
-                els.bgStatusTag.title = '点击"设置背景"按钮添加背景图片';
-            } else if (isLocalUrl) {
-                els.bgStatusTag.textContent = '🔗 外部链接（仅本地）';
-                els.bgStatusTag.className = 'bg-tag';
-                els.bgStatusTag.title = '使用外部图片链接，不占用存储空间，仅在本设备有效';
-            } else if (isSyncUrl) {
-                const modeName = isRemote 
-                    ? (storageMode === STORAGE_MODES.WEBDAV ? 'WebDAV' : 'Gist')
-                    : '云端';
-                els.bgStatusTag.textContent = `🔗 外部链接（已同步）`;
-                els.bgStatusTag.className = 'bg-tag accent';
-                els.bgStatusTag.title = `图片链接已保存到 ${modeName}，所有设备共享此背景`;
-            } else if (isRemote) {
-                const modeName = storageMode === STORAGE_MODES.WEBDAV ? 'WebDAV' : 'Gist';
-                els.bgStatusTag.textContent = `📦 本地私有（不随数据推送到 ${modeName}）`;
-                els.bgStatusTag.className = 'bg-tag';
-                els.bgStatusTag.title = '背景保存在本机设置中，需要同步请切换到云端模式';
-            } else {
-                els.bgStatusTag.textContent = '📦 本地私有';
-                els.bgStatusTag.className = 'bg-tag';
-                els.bgStatusTag.title = '背景图片存储在本地浏览器中，可导出或切换到云端同步';
-            }
+            els.bgStatusTag.textContent = '🔗 图片链接';
+            els.bgStatusTag.className = 'bg-tag';
         }
     }
-    
-    // 切换到对应的模式标签
+
     if (els.bgModeTabs && els.bgModePanels) {
-        const targetMode = (!isCloudMode && isUrl) ? 'url' : 'upload';
+        const targetMode = isUrl ? 'url' : 'upload';
         Array.from(els.bgModeTabs).forEach(t => {
-            const isUrlTab = t.dataset.mode === 'url';
             t.classList.toggle('active', t.dataset.mode === targetMode);
-            t.disabled = isCloudMode && isUrlTab;
+            t.disabled = false;
         });
         Array.from(els.bgModePanels).forEach(p => p.classList.toggle('hidden', p.dataset.mode !== targetMode));
     }
-    
+
     if (els.backgroundPreview) {
         const hasImage = !!actualImageUrl;
+        const previewUrl = resolveAssetDisplayUrl(actualImageUrl);
         els.backgroundPreview.classList.toggle('has-image', hasImage);
-        const previewUrl = actualImageUrl;
         els.backgroundPreview.style.backgroundImage = hasImage ? `url(${previewUrl})` : 'none';
         els.backgroundPreview.style.setProperty('--bg-preview-opacity', background.opacity);
     }
     if (els.clearBackgroundBtn) {
-        els.clearBackgroundBtn.disabled = !hasAnyImage;
-    }
-    if (isCloudMode && remoteReady && !hasAnyImage) {
-        refreshCloudBackgroundFromRemote({ notifyWhenMissing: false });
+        els.clearBackgroundBtn.disabled = !actualImageUrl;
     }
 }
 
@@ -7593,118 +6427,28 @@ async function handleBackgroundImageChange(event) {
         event.target.value = '';
         return;
     }
-    
-    const storageMode = getEffectiveStorageMode();
-    const isRemote = isRemoteMode(storageMode);
-    const isCloudMode = (appSettings.background?.mode === 'cloud');
-    if (isCloudMode && !isRemote) {
-        alert('云端同步背景需要先配置 WebDAV 或 Gist。');
-        event.target.value = '';
-        return;
-    }
-    
-    // 根据存储模式设置不同的大小限制
-    // 浏览器本地存储：2MB（压缩后约2.66MB，考虑其他设置数据）
-    // 大小限制策略：
-    // - 本地：无限制
-    // - WebDAV：无限制（服务器自行控制）
-    // - Gist：50MB（Base64 膨胀后约 67MB，Gist 可处理但建议压缩大图）
-    const isGist = storageMode === STORAGE_MODES.GIST;
-    const isWebDAV = storageMode === STORAGE_MODES.WEBDAV;
-    const GIST_HARD_LIMIT = 50 * 1024 * 1024; // 50MB 硬限制
-    const GIST_COMPRESS_THRESHOLD = 10 * 1024 * 1024; // 超过 10MB 建议压缩
-    const MAX_RESOLUTION = 3840; // 4K 分辨率
-    
-    const sizeMB = (file.size / 1024 / 1024).toFixed(2);
-    
-    // Gist 模式：超过 50MB 直接拒绝
-    if (isGist && file.size > GIST_HARD_LIMIT) {
-        alert(`图片过大（${sizeMB}MB），超过 Gist 支持的上限（50MB）\n\n推荐方案：\n1. 使用图床服务（如 imgur.com）并用"图片链接"模式\n2. 切换到 WebDAV 存储（无大小限制）`);
-        event.target.value = '';
-        return;
-    }
-    
-    try {
-        let imageDataUrl;
-        
-        // Gist 模式：超过 10MB 询问是否压缩
-        if (isGist && file.size > GIST_COMPRESS_THRESHOLD) {
-            const choice = await showGistCompressionChoice(sizeMB);
-            if (choice === 'cancel') {
-                event.target.value = '';
-                return;
-            }
-            if (choice === 'compress') {
-                imageDataUrl = await encodeImageForGist(file);
-            } else {
-                // 原图上传
-                imageDataUrl = await blobToDataURL(file);
-            }
-        } else if (isGist) {
-            // Gist 小图片直接转 DataURL
-            imageDataUrl = await blobToDataURL(file);
-        } else {
-            // 本地/WebDAV：直接读取，无大小限制
-            imageDataUrl = await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = (e) => resolve(e.target.result);
-                reader.onerror = reject;
-                reader.readAsDataURL(file);
-            });
-        }
 
-        if (isCloudMode) {
-            try {
-                const mimeType = file.type || inferMimeFromDataUrl(imageDataUrl);
-                const uploadName = buildBackgroundRemoteName(file.name, mimeType);
-                const prevCloudFile = appSettings.background?.cloud?.fileName;
-                const uploadResult = await uploadCloudBackground(imageDataUrl, uploadName, mimeType);
-                appSettings.background = normalizeBackgroundSettings({
-                    ...appSettings.background,
-                    mode: 'cloud',
-                    image: '',
-                    cloud: {
-                        ...appSettings.background.cloud,
-                        fileName: uploadResult?.fileName || uploadName,
-                        downloadUrl: stripCacheBust(uploadResult?.remoteUrl || appSettings.background.cloud.downloadUrl),
-                        updatedAt: Date.now(),
-                        etag: '',
-                        lastModified: ''
-                    }
-                });
-                const saveOk = await saveSettingsWithValidation();
-                if (!saveOk) {
-                    alert('保存失败：存储空间不足或本地存储受限');
-                    appSettings.background.image = '';
-                    event.target.value = '';
-                    return;
-                }
-                await cleanupOldCloudBackgroundFiles(uploadResult?.fileName || uploadName, prevCloudFile, storageMode);
-                applyBackgroundFromSettings({ allowBlocking: true });
-                updateBackgroundControlsUI();
-                persistBackgroundChange();
-                alert('云端背景已上传并生效。');
-            } catch (error) {
-                console.error('处理云端背景失败:', error);
-                alert(`云端背景上传失败：${error.message}`);
-            }
-            event.target.value = '';
-            return;
+    try {
+        const persistedUrl = await persistBlobAsset(file, {
+            fileName: file.name || 'background',
+            sourceUrl: `background:${file.name || ''}`
+        });
+        if (!persistedUrl) {
+            throw new Error('未返回资源地址');
         }
-        
         appSettings.background = normalizeBackgroundSettings({
             ...appSettings.background,
-            image: imageDataUrl
+            image: persistedUrl,
+            source: ''
         });
-        
-        // 保存并检查是否成功
         const saveSuccess = await saveSettingsWithValidation();
         if (!saveSuccess) {
-            const suggestion = isRemote 
-                ? '可能是网络问题或服务端限制' 
-                : '建议切换到 WebDAV/Gist 存储';
-            alert(`保存失败：存储空间不足\n${suggestion}`);
-            appSettings.background.image = '';
+            alert('保存失败，请检查数据库写入权限。');
+            appSettings.background = normalizeBackgroundSettings({
+                ...appSettings.background,
+                image: '',
+                source: ''
+            });
             event.target.value = '';
             return;
         }
@@ -7720,177 +6464,25 @@ async function handleBackgroundImageChange(event) {
     event.target.value = '';
 }
 
-async function compressImage(file, options = {}) {
-    const { maxSizeMB = 4, maxWidthOrHeight = 3840, quality = 0.95 } = options;
-    
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            const img = new Image();
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                let width = img.width;
-                let height = img.height;
-                
-                // 计算缩放比例
-                if (width > maxWidthOrHeight || height > maxWidthOrHeight) {
-                    if (width > height) {
-                        height = (height / width) * maxWidthOrHeight;
-                        width = maxWidthOrHeight;
-                    } else {
-                        width = (width / height) * maxWidthOrHeight;
-                        height = maxWidthOrHeight;
-                    }
-                }
-                
-                canvas.width = width;
-                canvas.height = height;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0, width, height);
-                
-                // 尝试不同的质量级别，直到满足大小要求
-                let currentQuality = quality;
-                let result = canvas.toDataURL('image/jpeg', currentQuality);
-                
-                // 如果仍然太大，继续降低质量
-                while (result.length > maxSizeMB * 1024 * 1024 && currentQuality > 0.3) {
-                    currentQuality -= 0.1;
-                    result = canvas.toDataURL('image/jpeg', currentQuality);
-                }
-                
-                resolve(result);
-            };
-            img.onerror = reject;
-            img.src = e.target.result;
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-    });
-}
-
-// --- Gist 专用图片压缩/编码（PNG/JPG 统一走 JPEG 压缩，确保大小可控） ---
-// Gist 存储图片为 Base64 文本，体积膨胀约 33%，实际可存储较大图片
-// 限制 10MB 原始大小（对应约 13MB Base64），平衡质量与同步效率
-const GIST_IMAGE_MAX_BYTES = 10 * 1024 * 1024; // 10MB 上限
-const GIST_IMAGE_MAX_WIDTH = 3840; // 4K 分辨率上限
-const GIST_JPEG_INITIAL_QUALITY = 0.85;
-
-// Gist 大图片压缩选择对话框
-function showGistCompressionChoice(sizeMB) {
-    return new Promise((resolve) => {
-        const message = `图片较大（${sizeMB}MB），上传到 Gist 可能需要较长时间。\n\n请选择：\n• 点击「确定」压缩后上传（压缩至 10MB 内，推荐）\n• 点击「取消」后选择是否上传原图`;
-        
-        if (confirm(message)) {
-            resolve('compress');
-        } else {
-            // 二次确认是否上传原图
-            const uploadOriginal = confirm(`是否直接上传原图（${sizeMB}MB）？\n\n⚠️ 大文件同步较慢，首次加载可能需要等待\n\n点击「确定」上传原图\n点击「取消」放弃上传`);
-            resolve(uploadOriginal ? 'original' : 'cancel');
-        }
-    });
-}
-
-function estimateBytesFromDataUrl(dataUrl = '') {
-    if (!dataUrl) return 0;
-    const commaIdx = dataUrl.indexOf(',');
-    const base64 = commaIdx === -1 ? dataUrl : dataUrl.slice(commaIdx + 1);
-    return Math.floor(base64.length * 3 / 4);
-}
-
-async function loadImageBitmap(file) {
-    if (typeof createImageBitmap === 'function') {
-        return createImageBitmap(file);
-    }
-    // 兼容不支持 createImageBitmap 的环境
-    const dataUrl = await blobToDataURL(file);
-    return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = reject;
-        img.src = dataUrl;
-    });
-}
-
-async function compressImageToJpegDataUrl(file, options = {}) {
-    const {
-        maxBytes = GIST_IMAGE_MAX_BYTES,
-        maxWidth = GIST_IMAGE_MAX_WIDTH,
-        initialQuality = GIST_JPEG_INITIAL_QUALITY,
-        minQuality = 0.4,
-        qualityStep = 0.1
-    } = options;
-
-    const bitmap = await loadImageBitmap(file);
-    let width = bitmap.width;
-    let height = bitmap.height;
-    if (width > maxWidth) {
-        const scale = maxWidth / width;
-        width = Math.round(width * scale);
-        height = Math.round(height * scale);
-    }
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas 2D context not available');
-    ctx.drawImage(bitmap, 0, 0, width, height);
-
-    let quality = initialQuality;
-    let lastDataUrl = '';
-    while (quality >= minQuality) {
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
-        lastDataUrl = dataUrl;
-        if (estimateBytesFromDataUrl(dataUrl) <= maxBytes) {
-            return dataUrl;
-        }
-        quality = Number((quality - qualityStep).toFixed(2));
-    }
-    return lastDataUrl;
-}
-
-async function encodeImageForGist(file) {
-    // 小文件直接转 DataURL，避免额外压缩损失
-    if (file.size <= GIST_IMAGE_MAX_BYTES) {
-        return blobToDataURL(file);
-    }
-
-    const compressed = await compressImageToJpegDataUrl(file, {
-        maxBytes: GIST_IMAGE_MAX_BYTES,
-        maxWidth: GIST_IMAGE_MAX_WIDTH,
-        initialQuality: GIST_JPEG_INITIAL_QUALITY,
-        minQuality: 0.4,
-        qualityStep: 0.1
-    });
-
-    if (estimateBytesFromDataUrl(compressed) > GIST_IMAGE_MAX_BYTES) {
-        throw new Error('图片压缩后仍然过大，无法同步到 Gist，请裁剪或降低分辨率后重试。');
-    }
-    return compressed;
-}
-
 function saveSettingsWithValidation() {
     return new Promise((resolve) => {
+        appSettings = mergeSettingsWithDefaults(appSettings);
+        syncCustomDomainToLocalStorage(appSettings.customDomain);
         chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: appSettings }, () => {
             if (chrome.runtime.lastError) {
                 console.error('保存设置失败:', chrome.runtime.lastError);
                 resolve(false);
             } else {
+                chrome.storage.local.remove([STORAGE_KEYS.BACKGROUND_IMAGE], () => {});
                 resolve(true);
             }
         });
     });
 }
 
-function handleBackgroundUrlChange() {
+async function handleBackgroundUrlChange() {
     if (!els.backgroundUrlInput) return;
     const url = els.backgroundUrlInput.value.trim();
-    const background = normalizeBackgroundSettings(appSettings.background);
-    if (background.mode === 'cloud') {
-        alert('云端同步背景仅支持上传图片，请使用“本地上传”后同步到云端。');
-        els.backgroundUrlInput.value = '';
-        return;
-    }
     
     if (!url) {
         clearBackgroundImage();
@@ -7904,28 +6496,32 @@ function handleBackgroundUrlChange() {
         alert('请输入有效的图片链接地址');
         return;
     }
-    
-    appSettings.background = normalizeBackgroundSettings({
-        ...appSettings.background,
-        image: url
-    });
-    saveSettings();
-    applyBackgroundFromSettings({ allowBlocking: true });
-    updateBackgroundControlsUI();
+
+    try {
+        const persistedUrl = await fetchExternalAssetToLocal(url, { maxBytes: DEFAULT_EXTERNAL_FETCH_MAX_BYTES });
+        if (!persistedUrl) {
+            throw new Error('无法下载该图片');
+        }
+        appSettings.background = normalizeBackgroundSettings({
+            ...appSettings.background,
+            image: persistedUrl,
+            source: url
+        });
+        saveSettings();
+        applyBackgroundFromSettings({ allowBlocking: true });
+        updateBackgroundControlsUI();
+        persistBackgroundChange();
+    } catch (error) {
+        console.error('拉取背景图片失败:', error);
+        alert(`拉取背景图片失败：${error.message}`);
+    }
 }
 
 function clearBackgroundImage() {
-    clearCloudBackgroundRuntime();
     appSettings.background = normalizeBackgroundSettings({
         ...appSettings.background,
         image: '',
-        cloud: {
-            ...appSettings.background.cloud,
-            downloadUrl: '',
-            updatedAt: 0,
-            etag: '',
-            lastModified: ''
-        }
+        source: ''
     });
     if (els.backgroundImageInput) {
         els.backgroundImageInput.value = '';
@@ -7950,35 +6546,6 @@ function bindBackgroundControls() {
     if (els.backgroundImageInput) {
         els.backgroundImageInput.addEventListener('change', handleBackgroundImageChange);
     }
-    if (els.backgroundSourceRadios) {
-        Array.from(els.backgroundSourceRadios).forEach(radio => {
-            radio.addEventListener('change', () => {
-                handleBackgroundSourceChange();
-            });
-        });
-    }
-    if (els.cloudRefreshBtn) {
-        els.cloudRefreshBtn.addEventListener('click', async () => {
-            await refreshCloudBackgroundFromRemote({ notifyWhenMissing: true });
-            updateBackgroundControlsUI();
-        });
-    }
-    if (els.cloudUploadBtn) {
-        els.cloudUploadBtn.addEventListener('click', () => {
-            const bg = normalizeBackgroundSettings(appSettings.background);
-            if (bg.mode !== 'cloud') {
-                alert('请先选择“云端同步”作为背景来源。');
-                return;
-            }
-            if (!isRemoteMode(appSettings.storageMode)) {
-                alert('云端背景需要先配置 WebDAV 或 Gist。');
-                return;
-            }
-            if (els.backgroundImageInput) {
-                els.backgroundImageInput.click();
-            }
-        });
-    }
     if (els.uiOpacity) {
         els.uiOpacity.addEventListener('input', handleUiOpacityInput);
         els.uiOpacity.addEventListener('change', (e) => handleUiOpacityInput(e, { persist: true }));
@@ -7996,17 +6563,11 @@ function bindBackgroundControls() {
         });
     }
     
-    // 背景模式切换
+    // 背景录入模式切换（上传/链接）
     if (els.bgModeTabs && els.bgModePanels) {
         Array.from(els.bgModeTabs).forEach(tab => {
             tab.addEventListener('click', () => {
                 const mode = tab.dataset.mode;
-                const bg = normalizeBackgroundSettings(appSettings.background);
-                if (bg.mode === 'cloud' && mode === 'url') {
-                    alert('云端背景仅支持上传文件后同步，不支持直接填写图片链接。');
-                    updateBackgroundControlsUI();
-                    return;
-                }
                 Array.from(els.bgModeTabs).forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
                 Array.from(els.bgModePanels).forEach(p => p.classList.toggle('hidden', p.dataset.mode !== mode));
             });
@@ -8025,17 +6586,7 @@ function bindBackgroundControls() {
 }
 
 function updateStorageInfoVisibility(mode) {
-    const current = mode || STORAGE_MODES.BROWSER;
-    toggleSettingsSection(els.browserStorageInfo, current === STORAGE_MODES.BROWSER);
-    toggleSettingsSection(els.syncStorageInfo, current === STORAGE_MODES.SYNC);
-    toggleSettingsSection(els.webdavStorageInfo, current === STORAGE_MODES.WEBDAV);
-    toggleSettingsSection(els.gistStorageInfo, current === STORAGE_MODES.GIST);
-    toggleSettingsSection(els.webdavConfig, current === STORAGE_MODES.WEBDAV);
-    toggleSettingsSection(els.gistConfig, current === STORAGE_MODES.GIST);
-    if (!isRemoteMode(current)) {
-        remoteActionsEnabled = false;
-        showRemoteActionsSection(false);
-    }
+    toggleSettingsSection(els.browserStorageInfo, true);
 }
 
 function toggleSettingsSection(el, show) {
@@ -8044,52 +6595,28 @@ function toggleSettingsSection(el, show) {
 }
 
 function populateSettingsForm() {
-    if (els.webdavEndpoint) {
-        els.webdavEndpoint.value = appSettings.webdav?.endpoint || '';
-    }
-    if (els.webdavUsername) {
-        els.webdavUsername.value = appSettings.webdav?.username || '';
-    }
-    if (els.webdavPassword) {
-        els.webdavPassword.value = appSettings.webdav?.password || '';
-    }
-    if (els.gistToken) {
-        els.gistToken.value = appSettings.gist?.token || '';
-    }
-    if (els.gistId) {
-        els.gistId.value = appSettings.gist?.gistId || '';
-    }
-    if (els.gistFilename) {
-        els.gistFilename.value = normalizeRemoteFilename(appSettings.gist?.filename);
+    // 填充自定义域名
+    if (els.customDomainInput) {
+        els.customDomainInput.value = appSettings.customDomain || '';
     }
     updateBackgroundControlsUI();
 }
 
 function syncSettingsFromUI() {
-    const selectedBgSource = Array.from(els.backgroundSourceRadios || []).find(r => r.checked);
-    const bgMode = selectedBgSource ? selectedBgSource.value : appSettings.background?.mode;
+    // 读取自定义域名设置
+    const customDomain = els.customDomainInput ? els.customDomainInput.value.trim() : (appSettings.customDomain || '');
     appSettings = mergeSettingsWithDefaults({
         ...appSettings,
-        webdav: {
-            ...appSettings.webdav,
-            endpoint: (els.webdavEndpoint?.value || '').trim(),
-            username: (els.webdavUsername?.value || '').trim(),
-            password: els.webdavPassword?.value || ''
-        },
-        gist: {
-            ...appSettings.gist,
-            token: (els.gistToken?.value || '').trim(),
-            gistId: (els.gistId?.value || '').trim(),
-            filename: normalizeRemoteFilename(els.gistFilename?.value || appSettings.gist?.filename)
-        },
+        customDomain,
         uiOpacity: els.uiOpacity ? parseInt(els.uiOpacity.value, 10) / 100 : appSettings.uiOpacity,
         background: normalizeBackgroundSettings({
             ...appSettings.background,
-            mode: bgMode === 'cloud' ? 'cloud' : 'local',
             opacity: els.backgroundOpacity ? parseInt(els.backgroundOpacity.value, 10) / 100 : appSettings.background?.opacity,
             image: appSettings.background?.image
         })
     });
+    appSettings.storageMode = STORAGE_MODES.BROWSER;
+    appSettings.background = normalizeBackgroundSettings(appSettings.background);
     if (appData && typeof appData === 'object') {
         appData.uiOpacity = appSettings.uiOpacity;
     }
@@ -8098,81 +6625,17 @@ function syncSettingsFromUI() {
 }
 
 function bindSettingsInputListeners() {
-    const inputs = [
-        els.webdavEndpoint,
-        els.webdavUsername,
-        els.webdavPassword,
-        els.gistToken,
-        els.gistId,
-        els.gistFilename
-    ];
-    inputs.forEach(input => {
-        if (!input) return;
-        input.addEventListener('change', handleSettingsFieldChange);
-        input.addEventListener('blur', handleSettingsFieldChange);
-    });
-}
-
-function handleSettingsFieldChange() {
-    syncSettingsFromUI();
-    saveSettings();
-    if (isRemoteMode(pendingStorageMode)) {
-        remoteActionsEnabled = false;
-        showRemoteActionsSection(false);
-    }
-}
-
-function getSelectedStorageMode() {
-    const selected = Array.from(els.storageModeRadios || []).find(r => r.checked);
-    return selected ? selected.value : appSettings.storageMode || STORAGE_MODES.BROWSER;
+    // 纯本地模式无需额外配置输入项
 }
 
 async function applyStorageConfig() {
     syncSettingsFromUI();
-    const selectedMode = getSelectedStorageMode();
-    pendingStorageMode = selectedMode;
-    if (isRemoteMode(selectedMode)) {
-        const valid = await testRemoteConnectivity(selectedMode);
-        if (!valid) {
-            remoteActionsEnabled = false;
-            showRemoteActionsSection(false);
-            alert('配置未能连接，请检查地址/凭证后重试。');
-            return;
-        }
-        saveSettings();
-        remoteActionsEnabled = true;
-        showRemoteActionsSection(true);
-        alert('配置已验证，请选择同步操作。');
-
-        // 如果背景选择了云端或已是云端模式，自动同步 UI 状态并尝试拉取背景
-        const bgRadio = Array.from(els.backgroundSourceRadios || []).find(r => r.checked);
-        const wantsCloud = (bgRadio && bgRadio.value === 'cloud') || appSettings.background?.mode === 'cloud';
-        if (wantsCloud && isRemoteBackgroundReady()) {
-            appSettings.background = normalizeBackgroundSettings({
-                ...appSettings.background,
-                mode: 'cloud',
-                image: ''
-            });
-            saveSettings();
-            applyBackgroundFromSettings({ allowBlocking: true });
-            updateBackgroundControlsUI();
-            refreshCloudBackgroundFromRemote({ notifyWhenMissing: false });
-        }
-        return;
-    }
-    remoteActionsEnabled = false;
-    showRemoteActionsSection(false);
-    await switchStorageMode(selectedMode);
-    alert('配置已应用。');
+    appSettings.storageMode = STORAGE_MODES.BROWSER;
+    saveSettings();
+    attachBackgroundToData(appData);
+    await saveData({ immediate: true });
+    updateStorageInfoVisibility(STORAGE_MODES.BROWSER);
     closeSettingsModal();
-}
-
-function showRemoteActionsSection(show) {
-    toggleSettingsSection(els.remoteActions, !!show);
-    const disabled = !show;
-    [els.remotePushBtn, els.remoteMergeBtn, els.remotePullBtn].forEach(btn => {
-        if (btn) btn.disabled = disabled;
-    });
 }
 
 function isPointerOutsideOpenModals(target) {
@@ -8200,6 +6663,25 @@ function setupEventListeners() {
     bindSettingsInputListeners();
     bindBackgroundControls();
     bindBookmarkSearchEvents();
+
+    if (els.sidebarToggleBtn) {
+        els.sidebarToggleBtn.addEventListener('click', () => {
+            toggleMobileSidebar();
+        });
+    }
+
+    if (els.sidebarBackdrop) {
+        els.sidebarBackdrop.addEventListener('click', () => {
+            closeMobileSidebar({ focusToggle: true });
+        });
+    }
+
+    window.addEventListener('resize', scheduleResponsiveLayoutSync, { passive: true });
+    window.addEventListener('orientationchange', scheduleResponsiveLayoutSync);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', scheduleResponsiveLayoutSync, { passive: true });
+        window.visualViewport.addEventListener('scroll', scheduleResponsiveLayoutSync, { passive: true });
+    }
     
     // 书签网格空白区域右键菜单
     if (els.bookmarkGrid) {
@@ -8285,7 +6767,10 @@ function setupEventListeners() {
         };
     }
     if (els.settingsBtn) {
-        els.settingsBtn.onclick = openSettingsModal;
+        els.settingsBtn.onclick = () => {
+            closeMobileSidebar();
+            openSettingsModal();
+        };
     }
     if (els.closeFolderBtn) {
         els.closeFolderBtn.onclick = () => {
@@ -8333,6 +6818,10 @@ function setupEventListeners() {
 
     window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
+            if (isMobileLayout() && isMobileSidebarOpen) {
+                closeMobileSidebar({ focusToggle: true });
+                return;
+            }
             // 如果在批量选择模式，先退出批量选择
             if (batchSelectState.enabled) {
                 toggleBatchSelectMode(false);
@@ -8362,6 +6851,7 @@ function setupEventListeners() {
 
     // 添加分类
     els.addCategoryBtn.onclick = () => {
+        closeMobileSidebar();
         els.categoryForm.reset();
         animateModalVisibility(els.categoryModal, { open: true });
     };
@@ -8513,6 +7003,20 @@ function setupEventListeners() {
 
         if (iconType === 'favicon') {
             await cacheBookmarkIcons(iconUrl, iconFallbacks);
+            iconUrl = resolveCachedIconSrc(iconUrl) || iconUrl;
+            iconFallbacks = (iconFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
+        } else if (iconType === 'custom' && iconUrl && iconUrl.startsWith('data:')) {
+            try {
+                const persistedCustomIcon = await persistDataUrlAsset(iconUrl, {
+                    fileName: 'custom-icon.png',
+                    sourceUrl: `custom-icon:${title}`
+                });
+                if (persistedCustomIcon) {
+                    iconUrl = persistedCustomIcon;
+                }
+            } catch (error) {
+                console.warn('保存自定义图标到本地数据库失败，已保留 data URL。', error);
+            }
         }
 
         const bookmarkData = {
@@ -8576,16 +7080,6 @@ function setupEventListeners() {
             }
         });
     }
-    if (els.remotePushBtn) {
-        els.remotePushBtn.addEventListener('click', () => handleRemoteSyncAction('push'));
-    }
-    if (els.remoteMergeBtn) {
-        els.remoteMergeBtn.addEventListener('click', () => handleRemoteSyncAction('merge'));
-    }
-    if (els.remotePullBtn) {
-        els.remotePullBtn.addEventListener('click', () => handleRemoteSyncAction('pull'));
-    }
-    
     // 页面卸载前确保数据已保存
     window.addEventListener('beforeunload', () => {
         // 同步刷新待保存的数据（使用 sendBeacon 或同步写入）

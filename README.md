@@ -1,8 +1,8 @@
-# My Local New Tab
+# WebNav
 
 <div align="center">
 
-**一个简洁、本地化、功能丰富的浏览器新标签页扩展**
+**可以部署在nas上的自定义导航页**
 
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Chrome Extension Manifest](https://img.shields.io/badge/manifest-v3-brightgreen.svg)](manifest.json)
@@ -15,14 +15,8 @@
 
 |  版本  |  日期   | 更新内容                                                                                                                                                         |
 | :----: | :-----: | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| v2.15  | 2026-2  | 修改获取网页略缩图标逻辑，成功率更高 |
-|  v2.1  | 2025-12 | 添加书签搜索；支持导入 Edge/Chrome/Safari 导出的书签 HTML 文件；支持批量选择、转移；调整界面大小；改进图标缓存策略；修复些许 bug                                 |
-|  v2.0  | 2025-12 | 重构背景图加载逻辑（同步动画、智能缓存）；Gist 支持最大 50MB 背景图；本地与 WebDAV 模式无大小限制；优化文件夹标题显示效果；支持由 Wetab 直接导出的.data 格式文件 |
-| v1.5.3 | 2025-12 | 可修改标签的透明度                                                                                                                                               |
-| v1.5.2 | 2025-12 | 限制 gist 图片大小，提供压缩，确保 gist 同步时能正常显示背景图                                                                                                   |
-| v1.5.1 | 2025-12 | 新建标签页时默认显示第一个分类                                                                                                                                   |
-|  v1.5  |    -    | 完成所有预期功能                                                                                                                                                 |
-|  v1.0  |    -    | 完成基本框架搭建；将 Wetab 导出配置文件后缀改为 json 后可导入该拓展                                                                                              |
+| v1  | 2026-2  | 继承于拓展插件，将数据存储于本地数据库中，去除云端模式 |
+
 
 ---
 
@@ -155,6 +149,41 @@
 3. **开始使用**
     - 打开新标签页，扩展会自动生效
     - 默认包含 Google、Bilibili、GitHub 三个示例书签
+
+#### Docker 部署（NAS / 本地模式网站）
+
+项目现在可直接作为网站运行，并使用 SQLite 持久化：
+
+- 书签数据与设置（替代 `chrome.storage`）
+- 背景图（数据库 BLOB）
+- 图标缓存（数据库 BLOB，访问路径如 `http://ip:19792/assets/<id>.<ext>`）
+
+构建并运行：
+
+```bash
+docker build -t webnav:latest .
+docker run -d \
+  --name webnav \
+  -p 19792:19792 \
+  -v /path/to/webnav-data:/data \
+  --restart unless-stopped \
+  webnav:latest
+```
+
+或直接：
+
+```bash
+docker compose up -d --build
+```
+
+启动后访问：
+
+- `http://<NAS-IP>:19792/`
+
+数据文件位置：
+
+- 容器内：`/data/webnav.db`
+- 宿主机：你挂载的 `-v /path/to/webnav-data:/data`
 
 ---
 

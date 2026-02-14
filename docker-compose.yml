@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  webnav:
+    image: evlst/webnav:latest
+    container_name: webnav
+    ports:
+      - "19792:19792"
+    volumes:
+      - ./data:/data
+    restart: always
