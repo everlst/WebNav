@@ -69,7 +69,7 @@
                 <form id="bookmarkForm">
                     <div class="form-group type-section type-link">
                         <label for="bookmarkUrl">网址 (URL)</label>
-                        <input type="url" id="bookmarkUrl" placeholder="https://example.com">
+                        <input type="text" inputmode="url" id="bookmarkUrl" placeholder="example.com">
                     </div>
                     <div class="form-group">
                         <label for="bookmarkTitle">标题</label>
@@ -253,6 +253,18 @@
                             <p>站点通过 SQLite 持久化保存数据（分类、书签、图标、背景图），重启容器后仍可恢复。</p>
                             <p class="path-tip">导出 JSON 时，资源地址会保留为 <code>/assets/xxx.ext</code> 或原始来源链接，避免重定向域名与动态端口导致失效。</p>
                         </div>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h4>图标缓存</h4>
+                    <div class="icon-cache-status-card">
+                        <div class="icon-cache-summary">
+                            <span id="iconCacheStatusText" class="icon-cache-status-text">正在检查...</span>
+                            <button type="button" id="retryUncachedIconsBtn" class="btn-secondary btn-compact" disabled>检查并重试</button>
+                        </div>
+                        <p class="tips">检查所有书签的图标是否已缓存到本地数据库。未缓存的图标依赖远程服务加载，可能在无代理时无法显示。</p>
+                        <div id="uncachedIconList" class="uncached-icon-list hidden"></div>
                     </div>
                 </div>
 

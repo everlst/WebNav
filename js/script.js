@@ -286,6 +286,8 @@ let pendingAutoIconSelectionSrc = null;
 let lastAutoIconUrl = '';
 let isFetchingAutoIcons = false;
 const DRAG_LONG_PRESS_MS = 90; // 调优为 90ms，提供更灵敏的选中体验
+const TOUCH_LONGPRESS_MS = 500; // 触屏长按阈值（弹出操作菜单）
+let isFormSubmitting = false; // 表单提交锁，防止重复提交
 const dragState = {
     timerId: null,
     draggingId: null,
@@ -338,6 +340,71 @@ const batchSelectState = {
     categoryId: null,
     folderId: null
 };
+
+// ======================== 自定义确认弹窗 ========================
+function showConfirmDialog(message, { title = '确认', confirmText = '确定', cancelText = '取消', danger = false } = {}) {
+    return new Promise((resolve) => {
+        // 移除可能存在的旧弹窗
+        const old = document.getElementById('customConfirmOverlay');
+        if (old) old.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'customConfirmOverlay';
+        overlay.className = 'confirm-overlay';
+
+        const dialog = document.createElement('div');
+        dialog.className = 'confirm-dialog';
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'confirm-title';
+        titleEl.textContent = title;
+
+        const msgEl = document.createElement('div');
+        msgEl.className = 'confirm-message';
+        msgEl.textContent = message;
+
+        const actions = document.createElement('div');
+        actions.className = 'confirm-actions';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn-secondary';
+        cancelBtn.textContent = cancelText;
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.className = danger ? 'btn-primary btn-danger' : 'btn-primary';
+        confirmBtn.textContent = confirmText;
+
+        const cleanup = (result) => {
+            overlay.classList.add('closing');
+            dialog.classList.add('closing');
+            const onEnd = () => { overlay.remove(); resolve(result); };
+            overlay.addEventListener('animationend', onEnd, { once: true });
+            // fallback if animationend doesn't fire
+            setTimeout(onEnd, 250);
+        };
+
+        cancelBtn.onclick = () => cleanup(false);
+        confirmBtn.onclick = () => cleanup(true);
+        overlay.addEventListener('pointerdown', (e) => {
+            if (e.target === overlay) cleanup(false);
+        });
+        document.addEventListener('keydown', function handler(e) {
+            if (e.key === 'Escape') { document.removeEventListener('keydown', handler); cleanup(false); }
+            if (e.key === 'Enter') { document.removeEventListener('keydown', handler); cleanup(true); }
+        });
+
+        actions.appendChild(cancelBtn);
+        actions.appendChild(confirmBtn);
+        dialog.appendChild(titleEl);
+        dialog.appendChild(msgEl);
+        dialog.appendChild(actions);
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        // 自动聚焦确认按钮
+        requestAnimationFrame(() => confirmBtn.focus());
+    });
+}
 
 function syncThemeWithSystem() {
     if (!window.matchMedia) return;
@@ -688,7 +755,12 @@ const els = {
     clearBookmarkSearch: document.getElementById('clearBookmarkSearch'),
     searchResultsPanel: document.getElementById('searchResultsPanel'),
     searchResultsGrid: document.getElementById('searchResultsGrid'),
-    searchResultsCount: document.getElementById('searchResultsCount')
+    searchResultsCount: document.getElementById('searchResultsCount'),
+
+    // 图标缓存诊断
+    iconCacheStatusText: document.getElementById('iconCacheStatusText'),
+    retryUncachedIconsBtn: document.getElementById('retryUncachedIconsBtn'),
+    uncachedIconList: document.getElementById('uncachedIconList')
 };
 
 function isMobileLayout() {
@@ -878,8 +950,15 @@ async function initializeApp() {
     // 8. 图标缓存已在编辑时按需获取，无需批量预热
     if (LOCAL_ONLY_MODE) {
         setTimeout(() => {
-            warmIconCacheForBookmarks();
+            warmIconCacheForBookmarks().then(() => {
+                // 预热完成后执行审计，检测仍未缓存的图标
+                auditIconCacheStatus();
+            });
         }, 600);
+        // 启动时也做一次快速审计（预热之前），输出日志
+        setTimeout(() => {
+            auditIconCacheStatus();
+        }, 100);
     }
 }
 
@@ -1513,14 +1592,28 @@ async function cacheBookmarkIcons(primary, fallbacks = []) {
 function purgeUnusedCachedIcons() {
     if (!iconCache || typeof iconCache !== 'object') return;
     const used = new Set();
+    const usedAssetIds = new Set();
     if (appData && Array.isArray(appData.categories)) {
         appData.categories.forEach(cat => {
             walkCategoryBookmarks(cat, (bm) => {
                 [bm.icon, ...(bm.iconFallbacks || [])].forEach(url => {
                     if (url) used.add(url);
+                    // 收集所有被引用的本地资产 ID
+                    const assetMatch = (url || '').match(/\/assets\/([0-9a-f]{32})/i);
+                    if (assetMatch) usedAssetIds.add(assetMatch[1]);
                 });
             });
         });
+    }
+    // 也收集缓存映射中指向的本地资产 ID
+    Object.values(iconCache).forEach(val => {
+        const m = (val || '').match(/\/assets\/([0-9a-f]{32})/i);
+        if (m) usedAssetIds.add(m[1]);
+    });
+    // 收集背景图资产
+    if (appData && appData.background && appData.background.image) {
+        const bgMatch = appData.background.image.match(/\/assets\/([0-9a-f]{32})/i);
+        if (bgMatch) usedAssetIds.add(bgMatch[1]);
     }
     let changed = false;
     Object.keys(iconCache).forEach(key => {
@@ -1531,6 +1624,24 @@ function purgeUnusedCachedIcons() {
     });
     if (changed) {
         saveIconCache();
+    }
+    // 调用后端清理孤立资产
+    _requestBackendAssetCleanup(Array.from(usedAssetIds));
+}
+
+/**
+ * 请求后端清理不再被引用的资产 BLOB
+ */
+async function _requestBackendAssetCleanup(activeAssetIds) {
+    try {
+        await fetchWithTimeout(resolveApiUrl('/api/assets/cleanup'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ activeIds: activeAssetIds })
+        }, NETWORK_FETCH_TIMEOUT);
+    } catch (error) {
+        // 清理失败不影响正常使用
+        console.warn('资产清理请求失败:', error);
     }
 }
 
@@ -1579,6 +1690,393 @@ async function warmIconCacheForBookmarks() {
         }
     } finally {
         isWarmingIconCache = false;
+    }
+}
+
+/**
+ * 后台异步缓存 favicon 图标（不阻塞保存流程）。
+ * 缓存完成后自动更新书签数据并刷新UI。
+ */
+async function _backgroundCacheIcons(bookmarkId, originalIconUrl, originalFallbacks) {
+    try {
+        const cached = await cacheBookmarkIcons(originalIconUrl, originalFallbacks);
+        if (cached) {
+            // 缓存成功，更新书签数据中的图标路径为本地路径
+            const loc = findBookmarkLocation(bookmarkId);
+            if (loc && loc.bookmark) {
+                const newIcon = resolveCachedIconSrc(originalIconUrl) || loc.bookmark.icon;
+                const newFallbacks = (originalFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
+                if (newIcon !== loc.bookmark.icon || JSON.stringify(newFallbacks) !== JSON.stringify(loc.bookmark.iconFallbacks)) {
+                    loc.bookmark.icon = newIcon;
+                    loc.bookmark.iconFallbacks = newFallbacks;
+                    saveData({ immediate: true });
+                    renderBookmarks();
+                    refreshOpenFolderView();
+                }
+            }
+        }
+    } catch (error) {
+        console.warn('后台图标缓存失败（将在下次预热时重试）:', error);
+    }
+}
+
+// ===== 图标缓存诊断 =====
+let uncachedIconReport = []; // { bookmarkId, title, url, icon, uncachedUrls[], status:'pending'|'ok'|'fail' }
+let isRetryingUncachedIcons = false;
+
+/**
+ * 判断某个图标 URL 是否已成功缓存到本地。
+ * 返回 true 表示已缓存（本地路径、data URL、或 iconCache 中有映射）。
+ */
+function isIconCachedLocally(src) {
+    if (!src || typeof src !== 'string') return true; // 空值视为无需缓存
+    if (src === 'icons/default.svg') return true;
+    if (src.startsWith('data:')) return true;
+    if (src.startsWith('icons/')) return true;
+    if (src.startsWith('chrome-extension://') || src.startsWith('moz-extension://')) return true;
+    const normalized = normalizePersistedAssetUrl(src);
+    if (isPersistedAssetReference(normalized) || isPersistedAssetReference(src)) return true;
+    if (iconCache && (iconCache[src] || iconCache[normalized])) return true;
+    return false;
+}
+
+/**
+ * 审计所有书签的图标缓存状态。
+ * 收集未缓存到本地的图标列表，输出控制台日志，更新 uncachedIconReport。
+ */
+function auditIconCacheStatus() {
+    if (!appData || !Array.isArray(appData.categories)) return;
+
+    const report = [];
+    let totalBookmarks = 0;
+    let cachedBookmarks = 0;
+
+    appData.categories.forEach(cat => {
+        walkCategoryBookmarks(cat, (bm) => {
+            if (bm.type === 'folder') return; // 文件夹本身没有图标
+            totalBookmarks++;
+
+            const uncachedUrls = [];
+            // 检查主图标
+            if (!isIconCachedLocally(bm.icon)) {
+                uncachedUrls.push(bm.icon);
+            }
+            // 检查备选图标
+            (bm.iconFallbacks || []).forEach(fb => {
+                if (!isIconCachedLocally(fb)) {
+                    uncachedUrls.push(fb);
+                }
+            });
+
+            if (uncachedUrls.length > 0) {
+                report.push({
+                    bookmarkId: bm.id,
+                    title: bm.title || '(无标题)',
+                    url: bm.url || '',
+                    icon: bm.icon,
+                    uncachedUrls,
+                    status: 'pending' // pending | ok | fail
+                });
+            } else {
+                cachedBookmarks++;
+            }
+        });
+    });
+
+    uncachedIconReport = report;
+
+    // 控制台日志输出
+    if (report.length === 0) {
+        console.log(`%c✅ 图标缓存状态：全部 ${totalBookmarks} 个书签的图标已缓存到本地`, 'color: #4caf50; font-weight: bold;');
+    } else {
+        console.group(`%c⚠️ 图标缓存状态：${report.length}/${totalBookmarks} 个书签的图标未缓存`, 'color: #ff9800; font-weight: bold;');
+        report.forEach(entry => {
+            console.warn(
+                `📌 ${entry.title} (${entry.url})\n` +
+                `   未缓存图标 (${entry.uncachedUrls.length}):`,
+                entry.uncachedUrls
+            );
+        });
+        console.groupEnd();
+    }
+
+    // 更新 UI（如果设置面板打开中）
+    updateIconCacheStatusUI();
+}
+
+/**
+ * 更新图标缓存诊断 UI 的显示状态。
+ */
+function updateIconCacheStatusUI() {
+    if (!els.iconCacheStatusText) return;
+
+    let totalBookmarks = 0;
+    if (appData && Array.isArray(appData.categories)) {
+        appData.categories.forEach(cat => {
+            walkCategoryBookmarks(cat, (bm) => {
+                if (bm.type !== 'folder') totalBookmarks++;
+            });
+        });
+    }
+
+    const uncachedCount = uncachedIconReport.length;
+    const cachedCount = totalBookmarks - uncachedCount;
+
+    if (uncachedCount === 0) {
+        els.iconCacheStatusText.textContent = `✅ 全部 ${totalBookmarks} 个图标已缓存`;
+        els.iconCacheStatusText.className = 'icon-cache-status-text all-cached';
+        if (els.retryUncachedIconsBtn) {
+            els.retryUncachedIconsBtn.textContent = '检查并重试';
+            els.retryUncachedIconsBtn.disabled = isRetryingUncachedIcons;
+        }
+    } else {
+        els.iconCacheStatusText.textContent = `⚠️ ${uncachedCount} 个图标未缓存（共 ${totalBookmarks} 个）`;
+        els.iconCacheStatusText.className = 'icon-cache-status-text has-uncached';
+        if (els.retryUncachedIconsBtn) {
+            els.retryUncachedIconsBtn.textContent = `重试未缓存 (${uncachedCount})`;
+            els.retryUncachedIconsBtn.disabled = isRetryingUncachedIcons;
+        }
+    }
+
+    // 渲染未缓存列表
+    renderUncachedIconList();
+}
+
+/**
+ * 渲染未缓存图标列表 UI。
+ */
+function renderUncachedIconList() {
+    if (!els.uncachedIconList) return;
+
+    if (uncachedIconReport.length === 0) {
+        els.uncachedIconList.classList.add('hidden');
+        els.uncachedIconList.innerHTML = '';
+        return;
+    }
+
+    els.uncachedIconList.classList.remove('hidden');
+    els.uncachedIconList.innerHTML = '';
+
+    uncachedIconReport.forEach((entry, idx) => {
+        const item = document.createElement('div');
+        item.className = 'uncached-icon-item';
+        item.dataset.index = idx;
+
+        // 图标预览
+        const img = document.createElement('img');
+        const resolvedSrc = resolveCachedIconSrc(entry.icon) || entry.icon || 'icons/default.svg';
+        img.src = resolvedSrc;
+        img.onerror = () => { img.src = 'icons/default.svg'; img.onerror = null; };
+        item.appendChild(img);
+
+        // 信息区
+        const info = document.createElement('div');
+        info.className = 'uncached-bm-info';
+        const titleEl = document.createElement('div');
+        titleEl.className = 'uncached-bm-title';
+        titleEl.textContent = entry.title;
+        titleEl.title = entry.title;
+        info.appendChild(titleEl);
+        const urlEl = document.createElement('div');
+        urlEl.className = 'uncached-bm-url';
+        urlEl.textContent = entry.url;
+        urlEl.title = entry.url;
+        info.appendChild(urlEl);
+        item.appendChild(info);
+
+        // 状态标签
+        const statusEl = document.createElement('span');
+        statusEl.className = 'uncached-bm-status status-' + entry.status;
+        if (entry.status === 'ok') {
+            statusEl.textContent = '已缓存';
+        } else if (entry.status === 'fail') {
+            statusEl.textContent = '失败';
+        } else {
+            statusEl.textContent = `${entry.uncachedUrls.length} 个未缓存`;
+        }
+        item.appendChild(statusEl);
+
+        // 单个重试按钮
+        const retryBtn = document.createElement('button');
+        retryBtn.className = 'retry-single-btn';
+        retryBtn.textContent = '↻';
+        retryBtn.title = '重试缓存此图标';
+        retryBtn.disabled = entry.status === 'ok' || isRetryingUncachedIcons;
+        retryBtn.addEventListener('click', () => retrySingleBookmarkIcon(idx));
+        item.appendChild(retryBtn);
+
+        els.uncachedIconList.appendChild(item);
+    });
+}
+
+/**
+ * 重试单个书签的图标缓存。
+ */
+async function retrySingleBookmarkIcon(reportIndex) {
+    const entry = uncachedIconReport[reportIndex];
+    if (!entry || entry.status === 'ok') return;
+
+    const loc = findBookmarkLocation(entry.bookmarkId);
+    if (!loc || !loc.bookmark) {
+        entry.status = 'fail';
+        renderUncachedIconList();
+        return;
+    }
+
+    const bm = loc.bookmark;
+    entry.status = 'pending';
+    renderUncachedIconList();
+
+    try {
+        // 尝试缓存主图标和所有备选
+        const allTargets = [bm.icon, ...(bm.iconFallbacks || [])].filter(Boolean);
+        const cached = await cacheBookmarkIcons(bm.icon, bm.iconFallbacks);
+
+        if (cached) {
+            // 更新书签数据中的图标路径为本地路径
+            const newIcon = resolveCachedIconSrc(bm.icon) || bm.icon;
+            const newFallbacks = (bm.iconFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
+            if (newIcon !== bm.icon || JSON.stringify(newFallbacks) !== JSON.stringify(bm.iconFallbacks)) {
+                bm.icon = newIcon;
+                bm.iconFallbacks = newFallbacks;
+                saveData({ immediate: true });
+            }
+        }
+
+        // 重新检查此书签是否全部缓存
+        const stillUncached = [];
+        if (!isIconCachedLocally(bm.icon)) stillUncached.push(bm.icon);
+        (bm.iconFallbacks || []).forEach(fb => {
+            if (!isIconCachedLocally(fb)) stillUncached.push(fb);
+        });
+
+        if (stillUncached.length === 0) {
+            entry.status = 'ok';
+            entry.uncachedUrls = [];
+        } else {
+            entry.status = 'fail';
+            entry.uncachedUrls = stillUncached;
+        }
+    } catch (error) {
+        console.warn(`重试缓存图标失败 [${entry.title}]:`, error);
+        entry.status = 'fail';
+    }
+
+    renderUncachedIconList();
+    updateIconCacheStatusUI();
+    renderBookmarks();
+    refreshOpenFolderView();
+}
+
+/**
+ * 批量重试所有未缓存的图标。
+ * 不阻塞 UI，分批并发执行。
+ */
+async function retryUncachedIcons() {
+    if (isRetryingUncachedIcons) return;
+
+    // 先刷新审计
+    auditIconCacheStatus();
+    if (uncachedIconReport.length === 0) return;
+
+    isRetryingUncachedIcons = true;
+    const total = uncachedIconReport.length;
+    let completed = 0;
+
+    if (els.retryUncachedIconsBtn) {
+        els.retryUncachedIconsBtn.disabled = true;
+        els.retryUncachedIconsBtn.textContent = `重试中 0/${total}...`;
+    }
+
+    const BATCH_SIZE = 3;
+    let anyChanged = false;
+
+    for (let i = 0; i < uncachedIconReport.length; i += BATCH_SIZE) {
+        const batch = uncachedIconReport.slice(i, i + BATCH_SIZE);
+        const tasks = batch.map(async (entry) => {
+            if (entry.status === 'ok') return;
+
+            const loc = findBookmarkLocation(entry.bookmarkId);
+            if (!loc || !loc.bookmark) {
+                entry.status = 'fail';
+                return;
+            }
+
+            const bm = loc.bookmark;
+            try {
+                const cached = await cacheBookmarkIcons(bm.icon, bm.iconFallbacks);
+                if (cached) {
+                    const newIcon = resolveCachedIconSrc(bm.icon) || bm.icon;
+                    const newFallbacks = (bm.iconFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
+                    if (newIcon !== bm.icon || JSON.stringify(newFallbacks) !== JSON.stringify(bm.iconFallbacks)) {
+                        bm.icon = newIcon;
+                        bm.iconFallbacks = newFallbacks;
+                        anyChanged = true;
+                    }
+                }
+
+                // 重新检查
+                const stillUncached = [];
+                if (!isIconCachedLocally(bm.icon)) stillUncached.push(bm.icon);
+                (bm.iconFallbacks || []).forEach(fb => {
+                    if (!isIconCachedLocally(fb)) stillUncached.push(fb);
+                });
+
+                if (stillUncached.length === 0) {
+                    entry.status = 'ok';
+                    entry.uncachedUrls = [];
+                } else {
+                    entry.status = 'fail';
+                    entry.uncachedUrls = stillUncached;
+                }
+            } catch (error) {
+                console.warn(`批量重试缓存图标失败 [${entry.title}]:`, error);
+                entry.status = 'fail';
+            }
+        });
+
+        await Promise.all(tasks);
+        completed += batch.length;
+
+        // 更新进度
+        if (els.retryUncachedIconsBtn) {
+            els.retryUncachedIconsBtn.textContent = `重试中 ${completed}/${total}...`;
+        }
+        renderUncachedIconList();
+    }
+
+    if (anyChanged) {
+        saveData({ immediate: true });
+        renderBookmarks();
+        refreshOpenFolderView();
+    }
+
+    isRetryingUncachedIcons = false;
+
+    // 最终审计刷新
+    auditIconCacheStatus();
+}
+
+/**
+ * 后台异步持久化 data: URL 自定义图标（不阻塞保存流程）。
+ */
+async function _backgroundPersistCustomIcon(bookmarkId, dataUrl, title) {
+    try {
+        const persistedUrl = await persistDataUrlAsset(dataUrl, {
+            fileName: 'custom-icon.png',
+            sourceUrl: `custom-icon:${title}`
+        });
+        if (persistedUrl) {
+            const loc = findBookmarkLocation(bookmarkId);
+            if (loc && loc.bookmark && loc.bookmark.icon === dataUrl) {
+                loc.bookmark.icon = persistedUrl;
+                saveData({ immediate: true });
+                renderBookmarks();
+                refreshOpenFolderView();
+            }
+        }
+    } catch (error) {
+        console.warn('后台自定义图标持久化失败，已保留 data URL。', error);
     }
 }
 
@@ -2051,6 +2549,57 @@ function createBookmarkCard(bm, context = {}) {
         e.preventDefault();
         e.stopPropagation();
         showBookmarkContextMenu(bm, context, e.clientX, e.clientY, card);
+    });
+
+    // 触屏长按弹出操作菜单（替代 hover 显示的编辑/删除按钮）
+    let touchLongPressTimer = null;
+    let touchDidLongPress = false;
+    let touchStartPos = null;
+
+    card.addEventListener('touchstart', (e) => {
+        touchDidLongPress = false;
+        const touch = e.touches[0];
+        touchStartPos = { x: touch.clientX, y: touch.clientY };
+        touchLongPressTimer = setTimeout(() => {
+            touchDidLongPress = true;
+            touchLongPressTimer = null;
+            // 触发震动反馈（如果支持）
+            if (navigator.vibrate) navigator.vibrate(30);
+            showBookmarkContextMenu(bm, context, touch.clientX, touch.clientY, card);
+        }, TOUCH_LONGPRESS_MS);
+    }, { passive: true });
+
+    card.addEventListener('touchmove', (e) => {
+        if (touchLongPressTimer && touchStartPos) {
+            const touch = e.touches[0];
+            const dx = touch.clientX - touchStartPos.x;
+            const dy = touch.clientY - touchStartPos.y;
+            // 移动超过 10px 取消长按
+            if (Math.sqrt(dx * dx + dy * dy) > 10) {
+                clearTimeout(touchLongPressTimer);
+                touchLongPressTimer = null;
+            }
+        }
+    }, { passive: true });
+
+    card.addEventListener('touchend', (e) => {
+        if (touchLongPressTimer) {
+            clearTimeout(touchLongPressTimer);
+            touchLongPressTimer = null;
+        }
+        // 如果刚执行了长按操作，阻止后续 click 事件触发导航
+        if (touchDidLongPress) {
+            e.preventDefault();
+            touchDidLongPress = false;
+        }
+    });
+
+    card.addEventListener('touchcancel', () => {
+        if (touchLongPressTimer) {
+            clearTimeout(touchLongPressTimer);
+            touchLongPressTimer = null;
+        }
+        touchDidLongPress = false;
     });
     
     return card;
@@ -3702,7 +4251,7 @@ function batchCreateFolder() {
 }
 
 // 批量删除选中的书签
-function batchDeleteSelected() {
+async function batchDeleteSelected() {
     const selectedIds = Array.from(batchSelectState.selectedIds);
     if (selectedIds.length === 0) return;
     
@@ -3711,7 +4260,8 @@ function batchDeleteSelected() {
         ? '确定删除所选书签吗？' 
         : `确定删除所选的 ${count} 个书签吗？`;
     
-    if (!confirm(confirmMsg)) return;
+    const confirmed = await showConfirmDialog(confirmMsg, { danger: true, confirmText: '删除' });
+    if (!confirmed) return;
     
     const sourceFolderId = batchSelectState.folderId;
     const sourceCategoryId = batchSelectState.categoryId;
@@ -4120,8 +4670,9 @@ function showSearchResultContextMenu(result, x, y, card) {
     }, 0);
 }
 
-function deleteCategory(id) {
-    if (!confirm('确定要删除这个分类及其所有书签吗？')) return;
+async function deleteCategory(id) {
+    const confirmed = await showConfirmDialog('确定要删除这个分类及其所有书签吗？', { danger: true, confirmText: '删除' });
+    if (!confirmed) return;
     
     appData.categories = appData.categories.filter(c => c.id !== id);
     // 如果删除了当前激活的分类，切换到第一个
@@ -4136,11 +4687,12 @@ function deleteCategory(id) {
     renderApp();
 }
 
-function deleteBookmark(id) {
+async function deleteBookmark(id) {
     const loc = findBookmarkLocation(id);
     if (!loc) return;
     const name = loc.bookmark.title || '此项目';
-    if (!confirm(`确定删除“${name}”？`)) return;
+    const confirmed = await showConfirmDialog(`确定删除“${name}”？`, { danger: true, confirmText: '删除' });
+    if (!confirmed) return;
     removeBookmarkById(id);
     // 删除是重要操作，立即保存
     saveData({ immediate: true });
@@ -5418,6 +5970,8 @@ function openSettingsModal() {
         radio.checked = radio.value === appSettings.storageMode;
     });
     updateStorageInfoVisibility(pendingStorageMode);
+    // 刷新图标缓存诊断状态
+    auditIconCacheStatus();
     if (els.settingsModal) {
         animateModalVisibility(els.settingsModal, { open: true });
     }
@@ -6772,6 +7326,9 @@ function setupEventListeners() {
             openSettingsModal();
         };
     }
+    if (els.retryUncachedIconsBtn) {
+        els.retryUncachedIconsBtn.addEventListener('click', retryUncachedIcons);
+    }
     if (els.closeFolderBtn) {
         els.closeFolderBtn.onclick = () => {
             if (openFolderId) {
@@ -6942,6 +7499,10 @@ function setupEventListeners() {
     // 保存书签/文件夹
     els.bookmarkForm.onsubmit = async (e) => {
         e.preventDefault();
+
+        // 防止重复提交
+        if (isFormSubmitting) return;
+
         const title = (els.bookmarkTitle.value || '').trim();
         if (!title) {
             alert('请输入名称');
@@ -6967,91 +7528,108 @@ function setupEventListeners() {
             alert('请输入有效网址');
             return;
         }
-        const iconTypeEl = document.querySelector('input[name="iconType"]:checked');
-        const iconType = iconTypeEl ? iconTypeEl.value : 'favicon';
-        
-        let iconUrl = '';
-        let iconFallbacks = [];
 
-        if (iconType === 'custom') {
-            if (selectedCustomIconSrc) {
-                iconUrl = selectedCustomIconSrc;
-            } else if (els.customIconInput.files.length > 0) {
-                iconUrl = await readFileAsDataURL(els.customIconInput.files[0]);
-            } else if (customIconMode === 'swatch') {
-                iconUrl = buildColorSwatchDataUrl(
-                    (els.swatchColor && els.swatchColor.value) || DEFAULT_SWATCH_COLOR,
-                    deriveSwatchText()
-                );
-                selectedCustomIconSrc = iconUrl;
-            } else if (modalState.editingId && els.iconPreview?.src) {
-                iconUrl = els.iconPreview.src;
-            }
-            iconFallbacks = [];
-        } else {
-            if (selectedAutoIcon) {
-                iconUrl = selectedAutoIcon.src;
-                iconFallbacks = autoIconCandidates
-                    .filter(candidate => candidate.src !== selectedAutoIcon.src)
-                    .map(candidate => candidate.src);
+        // 锁定提交，显示 loading
+        isFormSubmitting = true;
+        const submitBtn = els.bookmarkForm.querySelector('button[type="submit"], .btn-primary');
+        const formSubmitBtn = document.querySelector('#bookmarkModal .modal-footer .btn-primary');
+        const saveBtnEl = formSubmitBtn || submitBtn;
+        if (saveBtnEl) {
+            saveBtnEl.disabled = true;
+            saveBtnEl.dataset.origText = saveBtnEl.textContent;
+            saveBtnEl.textContent = '保存中…';
+            saveBtnEl.classList.add('is-saving');
+        }
+
+        try {
+            const iconTypeEl = document.querySelector('input[name="iconType"]:checked');
+            const iconType = iconTypeEl ? iconTypeEl.value : 'favicon';
+            
+            let iconUrl = '';
+            let iconFallbacks = [];
+
+            if (iconType === 'custom') {
+                if (selectedCustomIconSrc) {
+                    iconUrl = selectedCustomIconSrc;
+                } else if (els.customIconInput.files.length > 0) {
+                    iconUrl = await readFileAsDataURL(els.customIconInput.files[0]);
+                } else if (customIconMode === 'swatch') {
+                    iconUrl = buildColorSwatchDataUrl(
+                        (els.swatchColor && els.swatchColor.value) || DEFAULT_SWATCH_COLOR,
+                        deriveSwatchText()
+                    );
+                    selectedCustomIconSrc = iconUrl;
+                } else if (modalState.editingId && els.iconPreview?.src) {
+                    iconUrl = els.iconPreview.src;
+                }
+                iconFallbacks = [];
             } else {
-                const iconMeta = generateHighResIconMeta(normalizedUrl);
-                iconUrl = iconMeta.icon;
-                iconFallbacks = iconMeta.iconFallbacks;
-            }
-        }
-
-        if (iconType === 'favicon') {
-            await cacheBookmarkIcons(iconUrl, iconFallbacks);
-            iconUrl = resolveCachedIconSrc(iconUrl) || iconUrl;
-            iconFallbacks = (iconFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
-        } else if (iconType === 'custom' && iconUrl && iconUrl.startsWith('data:')) {
-            try {
-                const persistedCustomIcon = await persistDataUrlAsset(iconUrl, {
-                    fileName: 'custom-icon.png',
-                    sourceUrl: `custom-icon:${title}`
-                });
-                if (persistedCustomIcon) {
-                    iconUrl = persistedCustomIcon;
+                if (selectedAutoIcon) {
+                    iconUrl = selectedAutoIcon.src;
+                    iconFallbacks = autoIconCandidates
+                        .filter(candidate => candidate.src !== selectedAutoIcon.src)
+                        .map(candidate => candidate.src);
+                } else {
+                    const iconMeta = generateHighResIconMeta(normalizedUrl);
+                    iconUrl = iconMeta.icon;
+                    iconFallbacks = iconMeta.iconFallbacks;
                 }
-            } catch (error) {
-                console.warn('保存自定义图标到本地数据库失败，已保留 data URL。', error);
             }
-        }
 
-        const bookmarkData = {
-            id: modalState.editingId || generateId('bm'),
-            title,
-            url: normalizedUrl,
-            icon: iconUrl,
-            iconType,
-            iconFallbacks
-        };
+            // 对已有缓存做同步映射（不发起网络请求），其余的后台异步缓存
+            const resolvedIconUrl = resolveCachedIconSrc(iconUrl) || iconUrl;
+            const resolvedFallbacks = (iconFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
 
-        const targetList = getBookmarkList(categoryId, targetFolderId);
-        if (!targetList) {
-            alert('未找到目标分类，保存失败');
-            return;
-        }
-        let insertIndex = targetList.length;
+            const bookmarkData = {
+                id: modalState.editingId || generateId('bm'),
+                title,
+                url: normalizedUrl,
+                icon: resolvedIconUrl,
+                iconType,
+                iconFallbacks: resolvedFallbacks
+            };
 
-        if (modalState.editingId) {
-            const existingLoc = findBookmarkLocation(modalState.editingId);
-            if (existingLoc) {
-                const sameContainer = existingLoc.categoryId === categoryId && (existingLoc.parentFolderId || null) === targetFolderId;
-                if (sameContainer) {
-                    insertIndex = Math.min(existingLoc.index, targetList.length);
+            const targetList = getBookmarkList(categoryId, targetFolderId);
+            if (!targetList) {
+                alert('未找到目标分类，保存失败');
+                return;
+            }
+            let insertIndex = targetList.length;
+
+            if (modalState.editingId) {
+                const existingLoc = findBookmarkLocation(modalState.editingId);
+                if (existingLoc) {
+                    const sameContainer = existingLoc.categoryId === categoryId && (existingLoc.parentFolderId || null) === targetFolderId;
+                    if (sameContainer) {
+                        insertIndex = Math.min(existingLoc.index, targetList.length);
+                    }
+                    removeBookmarkAtLocation(existingLoc);
                 }
-                removeBookmarkAtLocation(existingLoc);
+            }
+
+            insertBookmarkToList(targetList, insertIndex, bookmarkData);
+            // 书签创建/编辑是重要操作，立即保存
+            saveData({ immediate: true });
+            renderApp();
+            refreshOpenFolderView();
+            closeModals({ keepFolderOpen });
+
+            // ---- 后台异步缓存图标（不阻塞UI） ----
+            const bmId = bookmarkData.id;
+            if (iconType === 'favicon') {
+                _backgroundCacheIcons(bmId, iconUrl, iconFallbacks);
+            } else if (iconType === 'custom' && iconUrl && iconUrl.startsWith('data:')) {
+                _backgroundPersistCustomIcon(bmId, iconUrl, title);
+            }
+        } finally {
+            // 解锁
+            isFormSubmitting = false;
+            if (saveBtnEl) {
+                saveBtnEl.disabled = false;
+                saveBtnEl.textContent = saveBtnEl.dataset.origText || '保存';
+                saveBtnEl.classList.remove('is-saving');
             }
         }
-
-        insertBookmarkToList(targetList, insertIndex, bookmarkData);
-        // 书签创建/编辑是重要操作，立即保存
-        saveData({ immediate: true });
-        renderApp();
-        refreshOpenFolderView();
-        closeModals({ keepFolderOpen });
     };
 
     if (els.exportDataBtn) {

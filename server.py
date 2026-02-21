@@ -234,6 +234,73 @@ class Database:
                 (asset_id,),
             ).fetchone()
 
+    def cleanup_unused_assets(self, active_ids: list[str], grace_days: int = 7) -> int:
+        """Delete assets not in active_ids and older than grace_days."""
+        if not active_ids:
+            # If no active IDs provided, only clean very old orphans
+            grace_days = max(grace_days, 30)
+        cutoff = now_ts() - grace_days * 86400
+        with self.lock:
+            if active_ids:
+                placeholders = ",".join("?" for _ in active_ids)
+                cursor = self.conn.execute(
+                    f"""DELETE FROM assets
+                       WHERE id NOT IN ({placeholders})
+                       AND created_at < ?""",
+                    [*active_ids, cutoff],
+                )
+            else:
+                cursor = self.conn.execute(
+                    "DELETE FROM assets WHERE created_at < ?",
+                    (cutoff,),
+                )
+            deleted = cursor.rowcount
+            if deleted > 0:
+                self.conn.commit()
+                # Reclaim disk space after large deletions
+                try:
+                    self.conn.execute("PRAGMA incremental_vacuum")
+                except Exception:
+                    pass
+            return deleted
+
+    def auto_cleanup_stale_assets(self, max_age_days: int = 30) -> int:
+        """Startup cleanup: remove assets older than max_age_days that are not
+        referenced in any storage value."""
+        with self.lock:
+            # Collect all asset IDs referenced in storage values
+            rows = self.conn.execute(
+                "SELECT value FROM storage WHERE area = 'local'"
+            ).fetchall()
+        referenced_ids: set[str] = set()
+        asset_pattern = re.compile(r"/assets/([0-9a-f]{32})", re.IGNORECASE)
+        for row in rows:
+            for m in asset_pattern.finditer(row["value"] or ""):
+                referenced_ids.add(m.group(1))
+        cutoff = now_ts() - max_age_days * 86400
+        with self.lock:
+            if referenced_ids:
+                placeholders = ",".join("?" for _ in referenced_ids)
+                cursor = self.conn.execute(
+                    f"""DELETE FROM assets
+                       WHERE id NOT IN ({placeholders})
+                       AND created_at < ?""",
+                    [*referenced_ids, cutoff],
+                )
+            else:
+                cursor = self.conn.execute(
+                    "DELETE FROM assets WHERE created_at < ?",
+                    (cutoff,),
+                )
+            deleted = cursor.rowcount
+            if deleted > 0:
+                self.conn.commit()
+                try:
+                    self.conn.execute("PRAGMA incremental_vacuum")
+                except Exception:
+                    pass
+            return deleted
+
 
 def fetch_remote_binary(url: str, max_bytes: int) -> tuple[bytes, str, str]:
     parsed = urllib.parse.urlparse(url)
@@ -391,6 +458,9 @@ class WebNavHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/assets/fetch":
             self._handle_assets_fetch()
+            return
+        if parsed.path == "/api/assets/cleanup":
+            self._handle_assets_cleanup()
             return
         if parsed.path == "/api/fetch/text":
             self._handle_text_fetch()
@@ -615,6 +685,26 @@ class WebNavHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, f"拉取远程文本失败: {error}"
             )
 
+    def _handle_assets_cleanup(self) -> None:
+        try:
+            payload = self._read_json()
+            active_ids = payload.get("activeIds") or []
+            if not isinstance(active_ids, list):
+                raise ValueError("activeIds 必须是数组")
+            active_ids = [str(i) for i in active_ids if i]
+            grace_days = int(payload.get("graceDays", 7))
+            deleted = self.db.cleanup_unused_assets(active_ids, grace_days=grace_days)
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": True, "deleted": deleted},
+            )
+        except ValueError as error:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(error))
+        except Exception as error:
+            self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"清理资产失败: {error}"
+            )
+
     def _handle_get_asset(self, path: str) -> None:
         match = re.fullmatch(r"/assets/([0-9a-f]{32})(?:\.([a-z0-9]{1,8}))?", path)
         if not match:
@@ -709,6 +799,14 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), WebNavHandler)
     print(f"WebNav server listening on http://{args.host}:{args.port}")
     print(f"SQLite DB: {(data_dir / 'webnav.db')}")
+
+    # Startup: auto-cleanup stale orphan assets (>30 days, unreferenced)
+    try:
+        cleaned = db.auto_cleanup_stale_assets(max_age_days=30)
+        if cleaned > 0:
+            print(f"Startup cleanup: removed {cleaned} stale asset(s)")
+    except Exception as e:
+        print(f"Startup cleanup warning: {e}")
 
     try:
         server.serve_forever()

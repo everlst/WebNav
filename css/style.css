@@ -314,10 +314,12 @@ header {
     transition: background-color 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 }
 
-.settings-fab:hover {
-    background: var(--primary-hover);
-    transform: scale(1.1) rotate(90deg);
-    box-shadow: 0 8px 24px rgba(0,120,212,0.3);
+@media (hover: hover) and (pointer: fine) {
+    .settings-fab:hover {
+        background: var(--primary-hover);
+        transform: scale(1.1) rotate(90deg);
+        box-shadow: 0 8px 24px rgba(0,120,212,0.3);
+    }
 }
 
 .settings-fab:active {
@@ -342,9 +344,11 @@ header {
     transition: transform 0.18s ease, background-color 0.2s ease, border-color 0.2s ease;
 }
 
-.sidebar-toggle-btn:hover {
-    background: var(--hover-bg);
-    border-color: var(--primary-color);
+@media (hover: hover) and (pointer: fine) {
+    .sidebar-toggle-btn:hover {
+        background: var(--hover-bg);
+        border-color: var(--primary-color);
+    }
 }
 
 .sidebar-toggle-btn:active {
@@ -400,9 +404,11 @@ main {
     touch-action: manipulation;
 }
 
-.sidebar li:hover {
-    background-color: var(--hover-bg);
-    transform: translateX(4px);
+@media (hover: hover) and (pointer: fine) {
+    .sidebar li:hover {
+        background-color: var(--hover-bg);
+        transform: translateX(4px);
+    }
 }
 
 .sidebar li.active {
@@ -438,14 +444,16 @@ main {
     padding: 2px 6px;
     transition: opacity 0.2s ease, color 0.2s ease, background 0.2s ease, transform 0.2s ease;
 }
-.sidebar li:hover .delete-cat {
-    opacity: 1;
-}
-.sidebar .delete-cat:hover {
-    color: red;
-    background: rgba(255,0,0,0.12);
-    border-radius: 4px;
-    transform: scale(1.1);
+@media (hover: hover) and (pointer: fine) {
+    .sidebar li:hover .delete-cat {
+        opacity: 1;
+    }
+    .sidebar .delete-cat:hover {
+        color: red;
+        background: rgba(255,0,0,0.12);
+        border-radius: 4px;
+        transform: scale(1.1);
+    }
 }
 
 .icon-btn {
@@ -460,10 +468,12 @@ main {
     transition: border-color 0.2s ease, color 0.2s ease, background-color 0.2s ease;
 }
 
-.icon-btn:hover {
-    border-color: var(--primary-color);
-    color: var(--primary-color);
-    background-color: var(--primary-soft);
+@media (hover: hover) and (pointer: fine) {
+    .icon-btn:hover {
+        border-color: var(--primary-color);
+        color: var(--primary-color);
+        background-color: var(--primary-soft);
+    }
 }
 
 /* Content Area */
@@ -559,9 +569,12 @@ main {
     animation: placeholderPulse 0.3s cubic-bezier(0.2, 0, 0.2, 1);
 }
 
-.bookmark-card:hover, .add-bookmark-card:hover {
-    transform: translateY(-4px);
-    box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+/* Hover effects only for devices with actual hover capability (mouse/trackpad) */
+@media (hover: hover) and (pointer: fine) {
+    .bookmark-card:hover, .add-bookmark-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+    }
 }
 
 .bookmark-card:active, .add-bookmark-card:active {
@@ -577,8 +590,10 @@ main {
     transition: transform 0.3s;
 }
 
-.bookmark-card:hover .bookmark-icon {
-    transform: scale(1.1);
+@media (hover: hover) and (pointer: fine) {
+    .bookmark-card:hover .bookmark-icon {
+        transform: scale(1.1);
+    }
 }
 
 .bookmark-title {
@@ -592,8 +607,10 @@ main {
     transition: color 0.2s;
 }
 
-.bookmark-card:hover .bookmark-title {
-    color: var(--primary-color);
+@media (hover: hover) and (pointer: fine) {
+    .bookmark-card:hover .bookmark-title {
+        color: var(--primary-color);
+    }
 }
 
 .add-bookmark-card {
@@ -612,15 +629,17 @@ main {
     transition: transform 0.3s;
 }
 
-.add-bookmark-card:hover .plus {
-    transform: rotate(90deg);
-    color: var(--primary-color);
-}
+@media (hover: hover) and (pointer: fine) {
+    .add-bookmark-card:hover .plus {
+        transform: rotate(90deg);
+        color: var(--primary-color);
+    }
 
-.add-bookmark-card:hover {
-    border-color: var(--primary-color);
-    background: var(--primary-soft);
-    color: var(--primary-color);
+    .add-bookmark-card:hover {
+        border-color: var(--primary-color);
+        background: var(--primary-soft);
+        color: var(--primary-color);
+    }
 }
 
 .add-bookmark-card .add-card-inner {
@@ -663,8 +682,10 @@ main {
     animation: fadeIn 0.2s ease-out;
 }
 
-.bookmark-card:hover .card-actions {
-    display: block;
+@media (hover: hover) and (pointer: fine) {
+    .bookmark-card:hover .card-actions {
+        display: block;
+    }
 }
 
 .action-btn {
@@ -678,15 +699,6 @@ main {
     color: var(--text-secondary);
     box-shadow: 0 2px 5px rgba(0,0,0,0.15);
     transition: color 0.2s ease, transform 0.2s ease;
-}
-
-.action-btn:hover {
-    color: var(--primary-color);
-    transform: scale(1.15);
-}
-
-.action-btn.delete:hover {
-    color: red;
 }
 
 /* Modal */
@@ -2150,5 +2162,268 @@ body.batch-select-active .folder-modal .add-bookmark-card {
     .settings-fab {
         right: 14px;
         bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    }
+}
+
+/* ===== 保存按钮 Loading 状态 ===== */
+.btn-primary.is-saving {
+    position: relative;
+    pointer-events: none;
+    opacity: 0.7;
+}
+
+.btn-primary.is-saving::after {
+    content: '';
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    margin-left: 6px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spinLoader 0.6s linear infinite;
+    vertical-align: middle;
+}
+
+@keyframes spinLoader {
+    to { transform: rotate(360deg); }
+}
+
+/* ===== 自定义确认弹窗 ===== */
+.confirm-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: rgba(0,0,0,0.45);
+    backdrop-filter: blur(4px);
+    animation: confirmFadeIn 0.18s ease-out;
+}
+
+.confirm-overlay.closing {
+    animation: confirmFadeOut 0.15s ease-in forwards;
+}
+
+.confirm-dialog {
+    background: var(--card-bg, #fff);
+    border-radius: 14px;
+    padding: 24px;
+    min-width: 280px;
+    max-width: 380px;
+    width: 90vw;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.25);
+    animation: confirmSlideUp 0.2s ease-out;
+}
+
+.confirm-dialog.closing {
+    animation: confirmSlideDown 0.15s ease-in forwards;
+}
+
+.confirm-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-color, #333);
+    margin-bottom: 8px;
+}
+
+.confirm-message {
+    font-size: 14px;
+    color: var(--text-secondary, #666);
+    line-height: 1.5;
+    margin-bottom: 20px;
+    word-break: break-word;
+}
+
+.confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
+.confirm-actions .btn-primary,
+.confirm-actions .btn-secondary {
+    min-width: 72px;
+    padding: 8px 18px;
+    font-size: 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.confirm-actions .btn-danger {
+    background: #e53935;
+    border-color: #e53935;
+}
+
+.confirm-actions .btn-danger:hover {
+    background: #c62828;
+    border-color: #c62828;
+}
+
+@keyframes confirmFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes confirmFadeOut {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+@keyframes confirmSlideUp {
+    from { opacity: 0; transform: translateY(16px) scale(0.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes confirmSlideDown {
+    from { opacity: 1; transform: translateY(0) scale(1); }
+    to { opacity: 0; transform: translateY(8px) scale(0.97); }
+}
+
+/* ===== 触屏操作按钮优化 ===== */
+/* On touch-only devices, hide hover action buttons;
+   users use long-press → context menu instead */
+@media (hover: none) {
+    .card-actions {
+        display: none !important;
+    }
+}
+
+/* ===== 图标缓存诊断 ===== */
+.icon-cache-status-card {
+    background: var(--muted-bg);
+    border-radius: 6px;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color);
+}
+
+.icon-cache-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.icon-cache-status-text {
+    font-size: 14px;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.icon-cache-status-text.all-cached {
+    color: #4caf50;
+}
+
+.icon-cache-status-text.has-uncached {
+    color: #ff9800;
+}
+
+.uncached-icon-list {
+    margin-top: 10px;
+    max-height: 240px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.uncached-icon-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px;
+    background: var(--card-bg);
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    font-size: 13px;
+    min-height: 36px;
+}
+
+.uncached-icon-item img {
+    width: 20px;
+    height: 20px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    object-fit: contain;
+    background: var(--muted-bg);
+}
+
+.uncached-icon-item .uncached-bm-info {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.uncached-icon-item .uncached-bm-title {
+    font-weight: 500;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.uncached-icon-item .uncached-bm-url {
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.uncached-icon-item .uncached-bm-status {
+    flex-shrink: 0;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+.uncached-icon-item .uncached-bm-status.status-pending {
+    color: #ff9800;
+    background: rgba(255, 152, 0, 0.1);
+}
+
+.uncached-icon-item .uncached-bm-status.status-ok {
+    color: #4caf50;
+    background: rgba(76, 175, 80, 0.1);
+}
+
+.uncached-icon-item .uncached-bm-status.status-fail {
+    color: #f44336;
+    background: rgba(244, 67, 54, 0.1);
+}
+
+.uncached-icon-item .retry-single-btn {
+    flex-shrink: 0;
+    border: none;
+    background: none;
+    color: var(--primary-color);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+.uncached-icon-item .retry-single-btn:hover {
+    background: rgba(var(--primary-rgb, 66, 133, 244), 0.1);
+}
+
+.uncached-icon-item .retry-single-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ===== action-btn hover ===== */
+@media (hover: hover) and (pointer: fine) {
+    .action-btn:hover {
+        color: var(--primary-color);
+        transform: scale(1.15);
+    }
+
+    .action-btn.delete:hover {
+        color: red;
     }
 }
