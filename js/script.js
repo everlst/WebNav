@@ -1757,16 +1757,10 @@ function auditIconCacheStatus() {
             totalBookmarks++;
 
             const uncachedUrls = [];
-            // 检查主图标
+            // 只检查主图标（备选图标是降级方案，不影响缓存状态判断）
             if (!isIconCachedLocally(bm.icon)) {
                 uncachedUrls.push(bm.icon);
             }
-            // 检查备选图标
-            (bm.iconFallbacks || []).forEach(fb => {
-                if (!isIconCachedLocally(fb)) {
-                    uncachedUrls.push(fb);
-                }
-            });
 
             if (uncachedUrls.length > 0) {
                 report.push({
@@ -1928,27 +1922,21 @@ async function retrySingleBookmarkIcon(reportIndex) {
     renderUncachedIconList();
 
     try {
-        // 尝试缓存主图标和所有备选
-        const allTargets = [bm.icon, ...(bm.iconFallbacks || [])].filter(Boolean);
-        const cached = await cacheBookmarkIcons(bm.icon, bm.iconFallbacks);
+        // 只缓存主图标（备选图标是降级方案，无需缓存）
+        const cached = await cacheIconIfNeeded(bm.icon);
 
         if (cached) {
-            // 更新书签数据中的图标路径为本地路径
+            // 更新书签数据中的主图标路径为本地路径
             const newIcon = resolveCachedIconSrc(bm.icon) || bm.icon;
-            const newFallbacks = (bm.iconFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
-            if (newIcon !== bm.icon || JSON.stringify(newFallbacks) !== JSON.stringify(bm.iconFallbacks)) {
+            if (newIcon !== bm.icon) {
                 bm.icon = newIcon;
-                bm.iconFallbacks = newFallbacks;
                 saveData({ immediate: true });
             }
         }
 
-        // 重新检查此书签是否全部缓存
+        // 重新检查主图标是否已缓存
         const stillUncached = [];
         if (!isIconCachedLocally(bm.icon)) stillUncached.push(bm.icon);
-        (bm.iconFallbacks || []).forEach(fb => {
-            if (!isIconCachedLocally(fb)) stillUncached.push(fb);
-        });
 
         if (stillUncached.length === 0) {
             entry.status = 'ok';
@@ -2004,23 +1992,18 @@ async function retryUncachedIcons() {
 
             const bm = loc.bookmark;
             try {
-                const cached = await cacheBookmarkIcons(bm.icon, bm.iconFallbacks);
+                const cached = await cacheIconIfNeeded(bm.icon);
                 if (cached) {
                     const newIcon = resolveCachedIconSrc(bm.icon) || bm.icon;
-                    const newFallbacks = (bm.iconFallbacks || []).map(item => resolveCachedIconSrc(item) || item);
-                    if (newIcon !== bm.icon || JSON.stringify(newFallbacks) !== JSON.stringify(bm.iconFallbacks)) {
+                    if (newIcon !== bm.icon) {
                         bm.icon = newIcon;
-                        bm.iconFallbacks = newFallbacks;
                         anyChanged = true;
                     }
                 }
 
-                // 重新检查
+                // 重新检查主图标
                 const stillUncached = [];
                 if (!isIconCachedLocally(bm.icon)) stillUncached.push(bm.icon);
-                (bm.iconFallbacks || []).forEach(fb => {
-                    if (!isIconCachedLocally(fb)) stillUncached.push(fb);
-                });
 
                 if (stillUncached.length === 0) {
                     entry.status = 'ok';
